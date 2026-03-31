@@ -89,6 +89,7 @@ add_executable(cursdar2
     src/render/gl_interop.cpp
     src/ui/ui.cpp
     src/cuda/renderer.cu
+    src/cuda/preprocess.cu
     src/cuda/gpu_pipeline.cu
     src/cuda/volume3d.cu
 )

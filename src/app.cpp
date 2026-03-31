@@ -2,6 +2,7 @@
 #include "nexrad/stations.h"
 #include "nexrad/level2_parser.h"
 #include "cuda/gpu_pipeline.cuh"
+#include "cuda/preprocess.cuh"
 #include "cuda/volume3d.cuh"
 #include "net/aws_nexrad.h"
 #include <nlohmann/json.hpp>
@@ -293,7 +294,7 @@ float bestUnfoldedVelocity(float velocity, float reference, float nyquist) {
     return best;
 }
 
-void dealiasVelocityProduct(PrecomputedSweep::ProductData& velPd, int numRadials) {
+void cpuDealiasVelocityProduct(PrecomputedSweep::ProductData& velPd, int numRadials) {
     if (!velPd.has_data || velPd.num_gates <= 0 || numRadials <= 2 || velPd.gates.empty())
         return;
 
@@ -439,7 +440,7 @@ void clusterMesoMarkers(std::vector<Detection::MesoMarker>& markers,
     markers.swap(clustered);
 }
 
-void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
+void cpuSuppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
     constexpr float kCoverageStrong = 0.95f;
     constexpr float kCoverageLoose = 0.88f;
     constexpr float kStdStrong = 12.0f;
@@ -490,6 +491,16 @@ void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
                 pd.gates[(size_t)gi * nr + ri] = 0;
         }
     }
+}
+
+void dealiasVelocityProduct(PrecomputedSweep::ProductData& velPd, int numRadials) {
+    if (!gpu_preprocess::dealiasVelocity(velPd, numRadials))
+        cpuDealiasVelocityProduct(velPd, numRadials);
+}
+
+void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
+    if (!gpu_preprocess::suppressReflectivityRings(sweeps))
+        cpuSuppressReflectivityRingArtifacts(sweeps);
 }
 
 bool parsedSweepHasProduct(const ParsedSweep& sweep, int product) {
