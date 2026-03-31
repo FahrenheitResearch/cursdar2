@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <regex>
 #ifdef _WIN32
@@ -714,6 +715,55 @@ PrecomputedSweep buildPrecomputedSweep(const gpu_pipeline::GpuIngestResult& inge
     return sweep;
 }
 
+bool normalizeGpuSweep(PrecomputedSweep& sweep) {
+    if (sweep.num_radials < 10 || sweep.azimuths.size() != (size_t)sweep.num_radials)
+        return false;
+
+    std::vector<int> keepIndices;
+    keepIndices.reserve(sweep.num_radials);
+    keepIndices.push_back(0);
+    for (int i = 1; i < sweep.num_radials; ++i) {
+        if (fabsf(sweep.azimuths[i] - sweep.azimuths[keepIndices.back()]) < 0.01f)
+            continue;
+        keepIndices.push_back(i);
+    }
+
+    if ((int)keepIndices.size() == sweep.num_radials)
+        return true;
+
+    std::vector<float> azimuths;
+    azimuths.reserve(keepIndices.size());
+    for (int idx : keepIndices)
+        azimuths.push_back(sweep.azimuths[idx]);
+    sweep.azimuths.swap(azimuths);
+
+    const int oldRadials = sweep.num_radials;
+    const int newRadials = (int)keepIndices.size();
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        auto& pd = sweep.products[p];
+        if (!pd.has_data || pd.num_gates <= 0 || pd.gates.empty())
+            continue;
+
+        std::vector<uint16_t> gates((size_t)pd.num_gates * (size_t)newRadials);
+        for (int g = 0; g < pd.num_gates; ++g) {
+            for (int r = 0; r < newRadials; ++r)
+                gates[(size_t)g * newRadials + r] = pd.gates[(size_t)g * oldRadials + keepIndices[r]];
+        }
+        pd.gates.swap(gates);
+    }
+
+    sweep.num_radials = newRadials;
+    return true;
+}
+
+void normalizeGpuWorkingSet(std::vector<PrecomputedSweep>& sweeps) {
+    sweeps.erase(std::remove_if(sweeps.begin(), sweeps.end(),
+                                [](PrecomputedSweep& sweep) {
+                                    return !normalizeGpuSweep(sweep);
+                                }),
+                 sweeps.end());
+}
+
 enum class GpuWorkingSetMode {
     LowestSweep,
     LowTilts,
@@ -727,27 +777,32 @@ struct FastGpuWorkingSet {
 };
 
 FastGpuWorkingSet buildGpuWorkingSetFromDecoded(const std::vector<uint8_t>& decodedBytes,
-                                                GpuWorkingSetMode mode) {
+                                                GpuWorkingSetMode mode,
+                                                float minElevationAngle = -1.0f,
+                                                bool reduceLowTilts = true,
+                                                bool allowEmpty = false) {
     FastGpuWorkingSet workingSet;
     if (decodedBytes.empty())
         return workingSet;
 
     if (mode == GpuWorkingSetMode::LowestSweep) {
         auto ingest = gpu_pipeline::ingestSweepGpu(decodedBytes.data(), decodedBytes.size());
-        if (!ingest.d_azimuths || ingest.num_radials <= 0) {
+        if (!ingest.parsed || ingest.truncated || !ingest.d_azimuths || ingest.num_radials <= 0) {
             gpu_pipeline::freeIngestResult(ingest);
             return workingSet;
         }
         workingSet.total_sweeps = std::max(ingest.total_sweeps, 1);
         workingSet.sweeps.push_back(buildPrecomputedSweep(ingest));
         gpu_pipeline::freeIngestResult(ingest);
+        normalizeGpuWorkingSet(workingSet.sweeps);
         workingSet.success = !workingSet.sweeps.empty();
         return workingSet;
     }
 
     const float maxElevation = (mode == GpuWorkingSetMode::LowTilts) ? 1.5f : -1.0f;
-    auto volume = gpu_pipeline::ingestVolumeGpu(decodedBytes.data(), decodedBytes.size(), maxElevation);
-    if (volume.sweeps.empty()) {
+    auto volume = gpu_pipeline::ingestVolumeGpu(decodedBytes.data(), decodedBytes.size(),
+                                                minElevationAngle, maxElevation);
+    if (!volume.parsed || volume.truncated) {
         gpu_pipeline::freeVolumeIngestResult(volume);
         return workingSet;
     }
@@ -757,9 +812,10 @@ FastGpuWorkingSet buildGpuWorkingSetFromDecoded(const std::vector<uint8_t>& deco
     for (const auto& ingest : volume.sweeps)
         workingSet.sweeps.push_back(buildPrecomputedSweep(ingest));
     gpu_pipeline::freeVolumeIngestResult(volume);
-    if (mode == GpuWorkingSetMode::LowTilts)
+    normalizeGpuWorkingSet(workingSet.sweeps);
+    if (mode == GpuWorkingSetMode::LowTilts && reduceLowTilts)
         workingSet.sweeps = buildReducedWorkingSetSweeps(std::move(workingSet.sweeps));
-    workingSet.success = !workingSet.sweeps.empty();
+    workingSet.success = allowEmpty ? true : !workingSet.sweeps.empty();
     return workingSet;
 }
 
@@ -1070,7 +1126,10 @@ Detection buildDetectionFromCandidates(const gpu_detection::HostDetectionResults
 
 Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
                                     float slat, float slon,
-                                    const std::string& stationName) {
+                                    const std::string& stationName,
+                                    bool* usedGpuPath = nullptr) {
+    if (usedGpuPath)
+        *usedGpuPath = false;
     int refSweep = -1, ccSweep = -1, zdrSweep = -1, velSweep = -1;
     for (int s = 0; s < (int)sweeps.size(); s++) {
         const auto& pc = sweeps[s];
@@ -1101,8 +1160,11 @@ Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
         gpuOk = false;
     }
 
-    if (gpuOk)
+    if (gpuOk) {
+        if (usedGpuPath)
+            *usedGpuPath = true;
         return buildDetectionFromCandidates(fields, slat, slon, stationName);
+    }
     return computeDetectionForSweepsCpu(sweeps, slat, slon, stationName);
 }
 
@@ -1255,19 +1317,19 @@ int App::stationLiveHistoryLimitLocked(int stationIdx) const {
     if (stationIdx < 0 || stationIdx >= (int)m_stations.size())
         return 0;
 
-    int activeLimit = 20;
-    int visibleLimit = 4;
-    int backgroundLimit = 2;
+    int activeLimit = std::max(MAX_LIVE_LOOP_FRAMES, 30);
+    int visibleLimit = 8;
+    int backgroundLimit = 4;
     switch (m_effectivePerformanceProfile) {
         case PerformanceProfile::Performance:
-            activeLimit = 8;
-            visibleLimit = 2;
-            backgroundLimit = 1;
+            activeLimit = std::max(MAX_LIVE_LOOP_FRAMES / 2, 16);
+            visibleLimit = 4;
+            backgroundLimit = 2;
             break;
         case PerformanceProfile::Balanced:
-            activeLimit = 12;
-            visibleLimit = 3;
-            backgroundLimit = 1;
+            activeLimit = std::max((MAX_LIVE_LOOP_FRAMES * 2) / 3, 20);
+            visibleLimit = 6;
+            backgroundLimit = 2;
             break;
         case PerformanceProfile::Auto:
         case PerformanceProfile::Quality:
@@ -1348,33 +1410,22 @@ bool App::ensureStationFullVolume(int stationIdx) {
     if (decoded.empty())
         return false;
 
-    auto gpuBuildStart = Clock::now();
-    auto gpuWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::AllSweeps);
-    timings.sweep_build_ms = elapsedMs(gpuBuildStart, Clock::now());
-
     std::vector<PrecomputedSweep> precomp;
     float detectionLat = fallbackLat;
     float detectionLon = fallbackLon;
     int totalSweeps = 0;
+    auto parseStart = Clock::now();
+    parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
+    timings.parse_ms = elapsedMs(parseStart, Clock::now());
+    if (parsed.sweeps.empty())
+        return false;
 
-    if (gpuWorkingSet.success && !gpuWorkingSet.sweeps.empty()) {
-        precomp = std::move(gpuWorkingSet.sweeps);
-        totalSweeps = gpuWorkingSet.total_sweeps;
-        timings.used_gpu_sweep_build = true;
-    } else {
-        auto parseStart = Clock::now();
-        parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
-        timings.parse_ms = elapsedMs(parseStart, Clock::now());
-        if (parsed.sweeps.empty())
-            return false;
-
-        detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
-        detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
-        auto buildStart = Clock::now();
-        precomp = buildPrecomputedSweeps(parsed);
-        timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
-        totalSweeps = (int)parsed.sweeps.size();
-    }
+    detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
+    detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
+    auto buildStart = Clock::now();
+    precomp = buildPrecomputedSweeps(parsed);
+    timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
+    totalSweeps = (int)parsed.sweeps.size();
 
     auto preprocessStart = Clock::now();
     if (dealiasEnabled)
@@ -1966,13 +2017,13 @@ void App::requestLiveLoopBackfill() {
             m_liveLoopBackfillQueue.push_back(std::move(frame));
         m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
     }
-    if (localFrames.empty())
+    if (localFrames.empty()) {
         resetLiveLoopFrameCache(false);
+        requestLiveLoopCapture();
+    }
 
     if ((int)localFrames.size() >= desiredFrames || currentKey.empty()) {
         m_liveLoopBackfillLoading = false;
-        if (localFrames.empty())
-            requestLiveLoopCapture();
         return;
     }
 
@@ -2009,6 +2060,7 @@ void App::requestLiveLoopBackfill() {
             }
             if (files.empty() && !fetchList(year, month, day, files)) {
                 m_liveLoopBackfillLoading = false;
+                requestLiveLoopCapture();
                 return;
             }
 
@@ -2023,6 +2075,7 @@ void App::requestLiveLoopBackfill() {
             }
             if (endIndex < 0) {
                 m_liveLoopBackfillLoading = false;
+                requestLiveLoopCapture();
                 return;
             }
 
@@ -2159,6 +2212,8 @@ void App::requestLiveLoopBackfill() {
                     m_liveLoopBackfillQueue.push_back(std::move(ordered.frame));
                 m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
                 m_liveLoopBackfillLoading = false;
+                if (orderedFrames.empty())
+                    requestLiveLoopCapture();
             }
         });
 }
@@ -2846,11 +2901,15 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
     float detectionLat = fallbackLat;
     float detectionLon = fallbackLon;
 
+    const GpuWorkingSetMode finalMode = preferFastLowestSweep
+        ? GpuWorkingSetMode::LowestSweep
+        : (keepFull ? GpuWorkingSetMode::AllSweeps : GpuWorkingSetMode::LowTilts);
     const bool runPreviewDetect = keepFull && !snapshotMode && !m_historicMode;
     FastGpuWorkingSet previewWorkingSet;
     if (runPreviewDetect) {
         auto previewBuildStart = Clock::now();
-        previewWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::LowTilts);
+        previewWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::LowTilts,
+                                                          -1.0f, false);
         timings.gpu_detect_build_ms = elapsedMs(previewBuildStart, Clock::now());
         if (previewWorkingSet.success && !previewWorkingSet.sweeps.empty()) {
             if (dealiasEnabled) {
@@ -2860,9 +2919,12 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
             }
 
             auto previewDetectStart = Clock::now();
-            detection = computeDetectionForSweeps(previewWorkingSet.sweeps, detectionLat, detectionLon, stationName);
+            bool previewUsedGpu = false;
+            detection = computeDetectionForSweeps(previewWorkingSet.sweeps,
+                                                  detectionLat, detectionLon,
+                                                  stationName, &previewUsedGpu);
             timings.gpu_detect_ms = elapsedMs(previewDetectStart, Clock::now());
-            timings.used_gpu_detect_stage = detection.computed;
+            timings.used_gpu_detect_stage = previewUsedGpu;
             haveDetection = detection.computed;
 
             if (haveDetection) {
@@ -2876,23 +2938,11 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
     }
 
     std::vector<PrecomputedSweep> precomp;
+    ParsedRadarData parsed = {};
     int totalSweeps = 0;
     bool finalAlreadyPreprocessed = false;
 
-    const GpuWorkingSetMode finalMode = preferFastLowestSweep
-        ? GpuWorkingSetMode::LowestSweep
-        : (keepFull ? GpuWorkingSetMode::AllSweeps : GpuWorkingSetMode::LowTilts);
-
-    if (runPreviewDetect && finalMode == GpuWorkingSetMode::LowTilts &&
-        previewWorkingSet.success && !previewWorkingSet.sweeps.empty()) {
-        precomp = std::move(previewWorkingSet.sweeps);
-        totalSweeps = previewWorkingSet.total_sweeps;
-        finalAlreadyPreprocessed = dealiasEnabled;
-        timings.sweep_build_ms = timings.gpu_detect_build_ms;
-        timings.used_gpu_sweep_build = true;
-    }
-
-    if (precomp.empty()) {
+    if (precomp.empty() && finalMode != GpuWorkingSetMode::AllSweeps) {
         auto buildStart = Clock::now();
         auto gpuWorkingSet = buildGpuWorkingSetFromDecoded(decoded, finalMode);
         timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
@@ -2903,7 +2953,6 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         }
     }
 
-    ParsedRadarData parsed = {};
     if (precomp.empty()) {
         auto parseStart = Clock::now();
         parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
@@ -3814,28 +3863,9 @@ void App::onMouseMove(double mx, double my) {
     if (!m_autoTrackStation)
         return;
 
-    // Find nearest station marker under the cursor
-    float bestDist = 1e9f;
-    int bestIdx = -1;
-    {
-        std::lock_guard<std::mutex> lock(m_stationMutex);
-        for (int i = 0; i < (int)m_stations.size(); i++) {
-            const float slat = m_stations[i].gpuInfo.lat != 0.0f ? m_stations[i].gpuInfo.lat : m_stations[i].lat;
-            const float slon = m_stations[i].gpuInfo.lon != 0.0f ? m_stations[i].gpuInfo.lon : m_stations[i].lon;
-            const float sx = (float)((slon - m_viewport.center_lon) * m_viewport.zoom + m_viewport.width * 0.5);
-            const float sy = (float)((m_viewport.center_lat - slat) * m_viewport.zoom + m_viewport.height * 0.5);
-            const float dx = (float)mx - sx;
-            const float dy = (float)my - sy;
-            const float dist = dx * dx + dy * dy;
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = i;
-            }
-        }
-    }
-
-    if (bestIdx >= 0 && bestDist > 24.0f * 24.0f)
-        bestIdx = -1;
+    // Find nearest station marker under the cursor using the same forgiving
+    // hit-test radius as click selection.
+    const int bestIdx = stationAtScreen(mx, my, 34.0f);
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
         m_activeStationIdx = bestIdx;
@@ -3853,8 +3883,6 @@ void App::onMouseMove(double mx, double my) {
             queueLiveStationRefresh(bestIdx, true);
         trimStationWorkingSet(bestIdx);
         trimLiveHistoryWorkingSet(bestIdx);
-    } else if (bestIdx < 0) {
-        m_activeStationIdx = -1;
     }
 }
 
@@ -4056,6 +4084,8 @@ void App::setDbzMinThreshold(float v) {
     if (m_historicMode)
         invalidateFrameCache(true);
     m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
 }
 
 void App::onRightDrag(double dx, double dy) {
@@ -4134,6 +4164,8 @@ void App::toggleSRV() {
     m_srvMode = !m_srvMode;
     invalidateFrameCache(true);
     m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
 }
 
 void App::setStormMotion(float speed, float dir) {
@@ -4141,6 +4173,8 @@ void App::setStormMotion(float speed, float dir) {
     m_stormDir = dir;
     invalidateFrameCache(true);
     m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
 }
 
 void App::rerenderAll() {

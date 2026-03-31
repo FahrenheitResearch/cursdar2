@@ -175,7 +175,7 @@ public:
 
     // Active station (nearest to mouse)
     int  activeStation() const { return m_activeStationIdx; }
-    int  stationAtScreen(double mx, double my, float radiusPx = 24.0f) const;
+    int  stationAtScreen(double mx, double my, float radiusPx = 34.0f) const;
     std::string activeStationName() const;
     void selectStation(int idx, bool centerView = false, double zoom = -1.0);
     bool showAll() const { return m_showAll; }
@@ -351,7 +351,7 @@ private:
     int              m_maxTilts = 1;
     float            m_activeTiltAngle = 0.5f;
     float            m_dbzMinThreshold = 5.0f;
-    float            m_velocityMinThreshold = 12.0f;
+    float            m_velocityMinThreshold = 0.0f;
     bool             m_snapshotMode = false;
     bool             m_snapshotLowestSweepOnly = false;
     std::string      m_snapshotLabel;

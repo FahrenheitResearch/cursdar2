@@ -949,8 +949,10 @@ void render(App& app) {
                 if (st.timings.decode_ms > 0.0f || st.timings.sweep_build_ms > 0.0f ||
                     st.timings.upload_ms > 0.0f) {
                     ImGui::Separator();
-                    ImGui::Text("Decode %.1f ms  Build %.1f ms  Upload %.1f ms",
-                                st.timings.decode_ms, st.timings.sweep_build_ms, st.timings.upload_ms);
+                    ImGui::Text("Ingest: decode %.1f ms  build %.1f ms",
+                                st.timings.decode_ms, st.timings.sweep_build_ms);
+                    if (st.timings.upload_ms > 0.0f)
+                        ImGui::Text("Latest upload: %.1f ms", st.timings.upload_ms);
                 }
             }
             ImGui::EndTooltip();
@@ -1022,14 +1024,15 @@ void render(App& app) {
         if (st.timings.decode_ms > 0.0f || st.timings.sweep_build_ms > 0.0f ||
             st.timings.preprocess_ms > 0.0f || st.timings.detection_ms > 0.0f ||
             st.timings.upload_ms > 0.0f || st.timings.gpu_detect_ms > 0.0f) {
-            ImGui::Text("Decode %.1f  Build %.1f  Pre %.1f  Detect %.1f  Upload %.1f ms",
+            ImGui::Text("Ingest: decode %.1f  build %.1f  pre %.1f  detect %.1f ms",
                         st.timings.decode_ms,
                         st.timings.sweep_build_ms,
                         st.timings.preprocess_ms,
-                        st.timings.detection_ms,
-                        st.timings.upload_ms);
+                        st.timings.detection_ms);
+            if (st.timings.upload_ms > 0.0f)
+                ImGui::Text("Latest upload: %.1f ms", st.timings.upload_ms);
             if (st.timings.used_gpu_detect_stage) {
-                ImGui::Text("Fast GPU detect: build %.1f  pre %.1f  detect %.1f ms",
+                ImGui::Text("Preview GPU detect: build %.1f  pre %.1f  detect %.1f ms",
                             st.timings.gpu_detect_build_ms,
                             st.timings.gpu_detect_preprocess_ms,
                             st.timings.gpu_detect_ms);

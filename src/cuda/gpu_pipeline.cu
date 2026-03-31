@@ -93,6 +93,12 @@ int countSetBits(uint32_t value) {
     return count;
 }
 
+int estimateMaxParsedRadials(size_t raw_size) {
+    const size_t estimate = raw_size / 1216 + 1024;
+    const size_t clamped = std::max<size_t>(8192, std::min<size_t>(estimate, 65536));
+    return (int)clamped;
+}
+
 } // namespace
 
 // ── GPU Parser Kernel ───────────────────────────────────────
@@ -536,9 +542,12 @@ bool buildSweepResult(const uint8_t* d_raw,
 
 int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
                GpuParsedRadial* d_radials_out, int max_radials,
-               cudaStream_t stream) {
+               cudaStream_t stream,
+               bool* out_truncated) {
     PipelineScratch& scratch = g_scratch;
     cudaStream_t activeStream = resolveStream(scratch, stream);
+    if (out_truncated)
+        *out_truncated = false;
     ensureCapacity(scratch.d_offsets, scratch.offset_capacity, (size_t)max_radials);
     ensureScalar(scratch.d_count);
     CUDA_CHECK(cudaMemsetAsync(scratch.d_count, 0, sizeof(int), activeStream));
@@ -571,6 +580,8 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
     if (h_count <= 0)
         return 0;
 
+    if (out_truncated && h_count > max_radials)
+        *out_truncated = true;
     h_count = (h_count > max_radials) ? max_radials : h_count;
 
     // Sort offsets
@@ -631,15 +642,19 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
                                 cudaMemcpyHostToDevice, activeStream));
 
     // Parse on GPU
-    constexpr int MAX_PARSED = 8192;
-    ensureCapacity(scratch.d_radials, scratch.radial_capacity, MAX_PARSED);
-    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)MAX_PARSED);
+    const int maxParsed = estimateMaxParsedRadials(raw_size);
+    ensureCapacity(scratch.d_radials, scratch.radial_capacity, maxParsed);
+    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)maxParsed);
 
     CUDA_CHECK(cudaStreamSynchronize(activeStream));
-    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, MAX_PARSED, activeStream);
+    bool truncated = false;
+    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, maxParsed,
+                                activeStream, &truncated);
     CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    result.truncated = truncated;
+    result.parsed = num_parsed > 0 && !truncated;
 
-    if (num_parsed <= 0)
+    if (num_parsed <= 0 || truncated)
         return result;
 
     ensureCapacity(scratch.d_lowest_key, scratch.lowest_key_capacity, (size_t)1);
@@ -737,6 +752,7 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
 }
 
 GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size,
+                                      float min_elevation_angle,
                                       float max_elevation_angle,
                                       cudaStream_t stream) {
     GpuVolumeIngestResult volume = {};
@@ -746,18 +762,22 @@ GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size
     CUDA_CHECK(cudaMemcpyAsync(scratch.d_raw, h_raw_data, raw_size,
                                cudaMemcpyHostToDevice, activeStream));
 
-    constexpr int MAX_PARSED = 8192;
-    ensureCapacity(scratch.d_radials, scratch.radial_capacity, MAX_PARSED);
-    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)MAX_PARSED);
+    const int maxParsed = estimateMaxParsedRadials(raw_size);
+    ensureCapacity(scratch.d_radials, scratch.radial_capacity, maxParsed);
+    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)maxParsed);
     ensureCapacity(scratch.d_lowest_key, scratch.lowest_key_capacity, (size_t)1);
     ensureCapacity(scratch.d_sweep_bits, scratch.sweep_bits_capacity, (size_t)8);
     ensureCapacity(scratch.d_selected_count, scratch.selected_count_capacity, (size_t)1);
     ensureCapacity(scratch.d_product_meta, scratch.product_meta_capacity, (size_t)NUM_PRODUCTS);
 
     CUDA_CHECK(cudaStreamSynchronize(activeStream));
-    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, MAX_PARSED, activeStream);
+    bool truncated = false;
+    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, maxParsed,
+                                activeStream, &truncated);
     CUDA_CHECK(cudaStreamSynchronize(activeStream));
-    if (num_parsed <= 0)
+    volume.truncated = truncated;
+    volume.parsed = num_parsed > 0 && !truncated;
+    if (num_parsed <= 0 || truncated)
         return volume;
 
     const uint32_t invalidLowestKey = 0xFFFFFFFFu;
@@ -788,6 +808,10 @@ GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size
             continue;
         }
         sweep.total_sweeps = volume.total_sweeps;
+        if (min_elevation_angle >= 0.0f && sweep.elevation_angle + 0.001f < min_elevation_angle) {
+            freeIngestResult(sweep);
+            continue;
+        }
         if (max_elevation_angle >= 0.0f && sweep.elevation_angle > max_elevation_angle + 0.001f) {
             freeIngestResult(sweep);
             continue;

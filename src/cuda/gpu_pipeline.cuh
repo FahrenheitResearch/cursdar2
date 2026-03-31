@@ -34,7 +34,8 @@ struct GpuParsedRadial {
 // Returns: number of radials found
 int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
                GpuParsedRadial* d_radials_out, int max_radials,
-               cudaStream_t stream = 0);
+               cudaStream_t stream = 0,
+               bool* out_truncated = nullptr);
 
 // ── 2. GPU Transposition Kernel ─────────────────────────────
 // Transpose gate data from radial-major to gate-major layout
@@ -72,11 +73,15 @@ struct GpuIngestResult {
     float     station_lat = 0.0f;
     float     station_lon = 0.0f;
     int       total_sweeps = 0;
+    bool      parsed = false;
+    bool      truncated = false;
 };
 
 struct GpuVolumeIngestResult {
     std::vector<GpuIngestResult> sweeps;
     int total_sweeps = 0;
+    bool parsed = false;
+    bool truncated = false;
 };
 
 // Run full GPU ingest for one sweep's worth of raw data
@@ -86,6 +91,7 @@ GpuIngestResult ingestSweepGpu(
 
 GpuVolumeIngestResult ingestVolumeGpu(
     const uint8_t* h_raw_data, size_t raw_size,
+    float min_elevation_angle = -1.0f,
     float max_elevation_angle = -1.0f,
     cudaStream_t stream = 0);
 
