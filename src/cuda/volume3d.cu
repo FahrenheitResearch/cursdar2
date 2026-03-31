@@ -681,10 +681,6 @@ namespace gpu {
 void initVolume() {
     freeVolume();
 
-    size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
-    CUDA_CHECK(cudaMalloc(&d_volume_raw, vol_size));
-    CUDA_CHECK(cudaMalloc(&d_volume_scratch, vol_size));
-
     cudaChannelFormatDesc desc = cudaCreateChannelDesc<float2>();
     cudaExtent extent = make_cudaExtent(VOL_XY, VOL_XY, VOL_Z);
     CUDA_CHECK(cudaMalloc3DArray(&d_volume_array, &desc, extent));
@@ -703,8 +699,9 @@ void initVolume() {
 
     CUDA_CHECK(cudaCreateTextureObject(&d_volume_tex, &res_desc, &tex_desc, nullptr));
 
-    printf("3D volume: %dx%dx%d, HW trilinear texture, %.1f MB\n",
-           VOL_XY, VOL_XY, VOL_Z, vol_size / (1024.0f * 1024.0f));
+    const size_t array_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
+    printf("3D volume texture: %dx%dx%d, HW trilinear texture, %.1f MB resident\n",
+           VOL_XY, VOL_XY, VOL_Z, array_size / (1024.0f * 1024.0f));
 }
 
 void freeVolume() {
@@ -739,7 +736,10 @@ VolumeQualitySettings getVolumeQuality() {
 
 size_t volumeWorkingSetBytes() {
     const size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
-    return vol_size * 3;
+    size_t total = d_volume_array ? vol_size : 0;
+    if (d_volume_raw) total += vol_size;
+    if (d_volume_scratch) total += vol_size;
+    return total;
 }
 
 void buildVolume(int station_idx, int product,
@@ -748,7 +748,13 @@ void buildVolume(int station_idx, int product,
                  const uint16_t* const* d_gates_per_sweep) {
     (void)station_idx;
     s_volumeReady = false;
-    if (num_sweeps <= 0 || !d_volume_raw || !d_volume_scratch) return;
+    if (num_sweeps <= 0 || !d_volume_array) return;
+
+    const size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
+    if (!d_volume_raw)
+        CUDA_CHECK(cudaMalloc(&d_volume_raw, vol_size));
+    if (s_volumeQuality.smooth_passes > 0 && !d_volume_scratch)
+        CUDA_CHECK(cudaMalloc(&d_volume_scratch, vol_size));
 
     std::vector<SweepDesc> h_sweeps;
     h_sweeps.reserve((num_sweeps < 32) ? num_sweeps : 32);
@@ -800,6 +806,15 @@ void buildVolume(int station_idx, int product,
     copy_params.extent = make_cudaExtent(VOL_XY, VOL_XY, VOL_Z);
     copy_params.kind = cudaMemcpyDeviceToDevice;
     CUDA_CHECK(cudaMemcpy3D(&copy_params));
+
+    if (d_volume_scratch) {
+        CUDA_CHECK(cudaFree(d_volume_scratch));
+        d_volume_scratch = nullptr;
+    }
+    if (d_volume_raw) {
+        CUDA_CHECK(cudaFree(d_volume_raw));
+        d_volume_raw = nullptr;
+    }
 
     s_volumeReady = true;
     printf("3D volume built: %d sweeps, HW trilinear ready\n", count);

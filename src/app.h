@@ -41,9 +41,15 @@ struct StationState {
     bool         rendered = false;
     bool         failed = false;
     std::string  error;
-    ParsedRadarData  parsedData;
+    std::vector<uint8_t> raw_volume_data;
     GpuStationInfo   gpuInfo;
     std::vector<PrecomputedSweep> precomputed; // all sweeps, ready for GPU
+    int          total_sweeps = 0;
+    float        lowest_sweep_elev = 0.0f;
+    int          lowest_sweep_radials = 0;
+    float        data_lat = 0.0f;
+    float        data_lon = 0.0f;
+    bool         full_volume_resident = false;
     std::chrono::steady_clock::time_point lastUpdate;
     std::chrono::steady_clock::time_point lastPollAttempt;
     std::string  latestVolumeKey;
@@ -118,7 +124,7 @@ public:
     std::string activeStationName() const;
     void selectStation(int idx, bool centerView = false, double zoom = -1.0);
     bool showAll() const { return m_showAll; }
-    void toggleShowAll() { m_showAll = !m_showAll; m_mode3D = false; }
+    void toggleShowAll();
     bool mode3D() const { return m_mode3D; }
     void toggle3D();
     void toggleCrossSection();
@@ -211,7 +217,7 @@ private:
     bool isCurrentDownloadGeneration(uint64_t generation) const;
     void failDownload(int stationIdx, uint64_t generation, std::string error);
     void refreshActiveTiltMetadata();
-    int currentAvailableTilts() const;
+    int currentAvailableTilts();
     void resetStationsForReload();
     void startDownloadsForTimestamp(int year, int month, int day, int hour, int minute);
     void queueLiveStationRefresh(int stationIdx, bool force = false);
@@ -223,6 +229,10 @@ private:
     void updateMemoryTelemetry(bool force = false);
     void ensureRenderTargets();
     void applyPerformanceProfile(bool force = false);
+    bool ensureStationFullVolume(int stationIdx);
+    void trimStationWorkingSet(int focusIdx = -1);
+    bool shouldKeepStationFullVolumeLocked(int stationIdx, int focusIdx) const;
+    void trimStationToLowestSweepLocked(StationState& st);
     bool stationLikelyVisible(int stationIdx) const;
     float livePollIntervalSecForStation(int stationIdx, const StationState& st) const;
     PerformanceProfile recommendedPerformanceProfile() const;
