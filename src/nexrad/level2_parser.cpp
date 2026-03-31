@@ -205,6 +205,65 @@ std::string trimRadarId(const char radarId[4]) {
     return id;
 }
 
+static std::vector<uint8_t> decompressGzip(const std::vector<uint8_t>& data);
+
+std::vector<uint8_t> decodeArchiveBytesImpl(const std::vector<uint8_t>& fileData,
+                                            Level2Parser::ProgressCallback cb,
+                                            int* totalBlocksOut) {
+    if (totalBlocksOut) *totalBlocksOut = 0;
+    if (fileData.size() < kArchiveHeaderSize) return {};
+
+    if (fileData.size() >= 2 && fileData[0] == 0x1F && fileData[1] == 0x8B) {
+        auto decompressed = decompressGzip(fileData);
+        if (decompressed.empty())
+            return {};
+        return decodeArchiveBytesImpl(decompressed, std::move(cb), totalBlocksOut);
+    }
+
+    const uint8_t* archiveData = fileData.data() + kArchiveHeaderSize;
+    const size_t archiveSize = fileData.size() - kArchiveHeaderSize;
+
+    std::vector<uint8_t> combined;
+    int totalBlocks = 0;
+
+    const auto blocks = findBlocks(archiveData, archiveSize);
+    if (!blocks.empty()) {
+        totalBlocks = (int)blocks.size();
+        for (int i = 0; i < totalBlocks; i++) {
+            const auto& block = blocks[i];
+            std::vector<uint8_t> decoded;
+            if (block.compressed) {
+                if (!decompressBZ2Stream(archiveData + block.offset, block.size, decoded, nullptr))
+                    decoded.clear();
+            } else {
+                decoded.assign(archiveData + block.offset, archiveData + block.offset + block.size);
+            }
+
+            if (!decoded.empty() && !appendBytes(combined, decoded.data(), decoded.size())) {
+                combined.clear();
+                break;
+            }
+
+            if (cb) cb(i + 1, totalBlocks);
+        }
+    }
+
+    if (combined.empty()) {
+        const auto fallbackBlocks = decompressLegacyStreams(archiveData, archiveSize);
+        totalBlocks = (int)fallbackBlocks.size();
+        for (int i = 0; i < totalBlocks; i++) {
+            if (!appendBytes(combined, fallbackBlocks[i].data(), fallbackBlocks[i].size())) {
+                combined.clear();
+                break;
+            }
+            if (cb) cb(i + 1, totalBlocks);
+        }
+    }
+
+    if (totalBlocksOut) *totalBlocksOut = totalBlocks;
+    return combined;
+}
+
 static std::vector<uint8_t> decompressGzip(const std::vector<uint8_t>& data) {
 #ifdef _WIN32
     DECOMPRESSOR_HANDLE h = NULL;
@@ -468,19 +527,14 @@ ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData) {
     return parse(fileData, nullptr);
 }
 
+std::vector<uint8_t> Level2Parser::decodeArchiveBytes(const std::vector<uint8_t>& fileData) {
+    return decodeArchiveBytesImpl(fileData, nullptr, nullptr);
+}
+
 ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
                                     ProgressCallback cb) {
     ParsedRadarData result;
     if (fileData.size() < kArchiveHeaderSize) return result;
-
-    if (fileData.size() >= 2 && fileData[0] == 0x1F && fileData[1] == 0x8B) {
-        auto decompressed = decompressGzip(fileData);
-        if (decompressed.empty()) {
-            std::printf("  gzip decompression failed\n");
-            return result;
-        }
-        return parse(decompressed, cb);
-    }
 
     VolumeHeader vh = {};
     if (readStruct(fileData.data(), fileData.size(), 0, vh) &&
@@ -488,44 +542,8 @@ ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
         result.station_id = vh.station();
     }
 
-    const uint8_t* archiveData = fileData.data() + kArchiveHeaderSize;
-    const size_t archiveSize = fileData.size() - kArchiveHeaderSize;
-
-    std::vector<uint8_t> combined;
     int totalBlocks = 0;
-
-    const auto blocks = findBlocks(archiveData, archiveSize);
-    if (!blocks.empty()) {
-        totalBlocks = (int)blocks.size();
-        for (int i = 0; i < totalBlocks; i++) {
-            const auto& block = blocks[i];
-            std::vector<uint8_t> decoded;
-            if (block.compressed) {
-                decoded = decompressBZ2Block(archiveData + block.offset, block.size);
-            } else {
-                decoded.assign(archiveData + block.offset, archiveData + block.offset + block.size);
-            }
-
-            if (!decoded.empty() && !appendBytes(combined, decoded.data(), decoded.size())) {
-                combined.clear();
-                break;
-            }
-
-            if (cb) cb(i + 1, totalBlocks);
-        }
-    }
-
-    if (combined.empty()) {
-        const auto fallbackBlocks = decompressLegacyStreams(archiveData, archiveSize);
-        totalBlocks = (int)fallbackBlocks.size();
-        for (int i = 0; i < totalBlocks; i++) {
-            if (!appendBytes(combined, fallbackBlocks[i].data(), fallbackBlocks[i].size())) {
-                combined.clear();
-                break;
-            }
-            if (cb) cb(i + 1, totalBlocks);
-        }
-    }
+    std::vector<uint8_t> combined = decodeArchiveBytesImpl(fileData, cb, &totalBlocks);
 
     if (!combined.empty()) {
         parseMessages(combined.data(), combined.size(), result);

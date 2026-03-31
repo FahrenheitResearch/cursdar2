@@ -2,6 +2,9 @@
 #include "../nexrad/level2.h"
 #include <cstdio>
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <thrust/execution_policy.h>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
 
@@ -37,6 +40,21 @@ __device__ float d_bswapf(float v) {
     float r;
     memcpy(&r, &i, 4);
     return r;
+}
+
+__device__ __forceinline__ uint16_t d_read_be16(const uint8_t* p) {
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+__device__ __forceinline__ uint32_t d_read_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+__device__ __forceinline__ float d_read_bef(const uint8_t* p) {
+    return __uint_as_float(d_read_be32(p));
 }
 
 // Product code matching on GPU
@@ -77,8 +95,8 @@ __global__ void parseMsg31Kernel(
     // Parse Msg31 header
     // Bytes 12-15: azimuth angle (float32 BE)
     // Bytes 24-27: elevation angle (float32 BE)
-    r.azimuth = d_bswapf(*(const float*)(msg + 12));
-    r.elevation = d_bswapf(*(const float*)(msg + 24));
+    r.azimuth = d_read_bef(msg + 12);
+    r.elevation = d_read_bef(msg + 24);
     r.radial_status = msg[21];
     r.elevation_number = msg[22];
 
@@ -87,15 +105,14 @@ __global__ void parseMsg31Kernel(
     if (r.elevation < -2.0f || r.elevation > 90.0f) { r.azimuth = -1; return; }
 
     // Data block count at bytes 30-31
-    uint16_t block_count = d_bswap16(*(const uint16_t*)(msg + 30));
+    uint16_t block_count = d_read_be16(msg + 30);
     if (block_count < 1 || block_count > 20) return;
-
-    // Data block pointers start at byte 32
-    const uint32_t* ptrs = (const uint32_t*)(msg + 32);
+    if (32 + (size_t)block_count * sizeof(uint32_t) > msg_remain) return;
 
     for (int b = 0; b < block_count && b < 10; b++) {
-        uint32_t bptr = d_bswap32(ptrs[b]);
+        uint32_t bptr = d_read_be32(msg + 32 + b * sizeof(uint32_t));
         if (bptr == 0 || bptr >= msg_remain) continue;
+        if (bptr + 4 > msg_remain) continue;
 
         const uint8_t* block = msg + bptr;
         char btype = (char)block[0];
@@ -106,22 +123,31 @@ __global__ void parseMsg31Kernel(
             if (p < 0 || p >= NUM_PRODUCTS) continue;
             if (bptr + 28 > msg_remain) continue;
 
-            r.num_gates[p] = d_bswap16(*(const uint16_t*)(block + 8));
-            r.first_gate[p] = d_bswap16(*(const uint16_t*)(block + 10));
-            r.gate_spacing[p] = d_bswap16(*(const uint16_t*)(block + 12));
+            r.num_gates[p] = d_read_be16(block + 8);
+            r.first_gate[p] = d_read_be16(block + 10);
+            r.gate_spacing[p] = d_read_be16(block + 12);
             r.data_word_size[p] = block[19];
-            r.scale[p] = d_bswapf(*(const float*)(block + 20));
-            r.offset[p] = d_bswapf(*(const float*)(block + 24));
+            r.scale[p] = d_read_bef(block + 20);
+            r.offset[p] = d_read_bef(block + 24);
 
             // Store the absolute byte offset to gate data within raw buffer
             r.moment_offsets[p] = (int)((msg + bptr + 28) - raw);
 
+            const int gateBytesPerWord = (r.data_word_size[p] == 16) ? 2 : (r.data_word_size[p] == 8 ? 1 : 0);
             if (r.num_gates[p] == 0 || r.num_gates[p] > 2000) {
                 r.moment_offsets[p] = -1;
                 r.num_gates[p] = 0;
             }
-            if (r.scale[p] == 0.0f) {
+            if (gateBytesPerWord == 0 || r.gate_spacing[p] <= 0) {
                 r.moment_offsets[p] = -1;
+            }
+            if (r.scale[p] == 0.0f || !isfinite(r.scale[p]) || !isfinite(r.offset[p])) {
+                r.moment_offsets[p] = -1;
+            }
+            const size_t gateBytes = (size_t)r.num_gates[p] * gateBytesPerWord;
+            if (r.moment_offsets[p] >= 0 && bptr + 28 + gateBytes > msg_remain) {
+                r.moment_offsets[p] = -1;
+                r.num_gates[p] = 0;
             }
         }
     }
@@ -261,9 +287,10 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     if (h_count > 0) {
+        const int aligned_count = (h_count > max_radials) ? max_radials : h_count;
         // Pass 2: find variable-offset messages
-        findVariableOffsetsKernel<<<(h_count + 255) / 256, 256, 0, stream>>>(
-            d_raw_data, raw_size, d_offsets, h_count,
+        findVariableOffsetsKernel<<<(aligned_count + 255) / 256, 256, 0, stream>>>(
+            d_raw_data, raw_size, d_offsets, aligned_count,
             d_offsets, d_count, max_radials);
 
         CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count, sizeof(int),
@@ -281,7 +308,7 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
 
     // Sort offsets
     thrust::device_ptr<int> d_off_ptr(d_offsets);
-    thrust::sort(d_off_ptr, d_off_ptr + h_count);
+    thrust::sort(thrust::cuda::par.on(stream), d_off_ptr, d_off_ptr + h_count);
 
     // Parse all found messages
     parseMsg31Kernel<<<(h_count + 255) / 256, 256, 0, stream>>>(
@@ -301,56 +328,31 @@ struct AzimuthSortKey {
 void transposeGatesGpu(
     const uint8_t* d_raw_data,
     const GpuParsedRadial* d_radials,
-    int num_radials,
+    const int* d_radial_indices,
+    int num_output_radials,
     int product,
     uint16_t* d_output,
     int out_num_gates,
     float* d_azimuths_out,
     cudaStream_t stream)
 {
-    // Build sort indices (sort radials by azimuth)
-    // Copy radials to host, sort, upload indices
-    std::vector<GpuParsedRadial> h_radials(num_radials);
-    CUDA_CHECK(cudaMemcpy(h_radials.data(), d_radials,
-                           num_radials * sizeof(GpuParsedRadial),
-                           cudaMemcpyDeviceToHost));
-
-    // Filter valid radials and sort by azimuth
-    std::vector<int> indices;
-    indices.reserve(num_radials);
-    for (int i = 0; i < num_radials; i++) {
-        if (h_radials[i].azimuth >= 0.0f && h_radials[i].azimuth < 360.0f)
-            indices.push_back(i);
-    }
-    std::sort(indices.begin(), indices.end(), [&](int a, int b) {
-        return h_radials[a].azimuth < h_radials[b].azimuth;
-    });
-
-    int valid_count = (int)indices.size();
-    if (valid_count == 0) return;
-
-    // Upload sorted indices
-    int* d_indices;
-    CUDA_CHECK(cudaMalloc(&d_indices, valid_count * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_indices, indices.data(),
-                           valid_count * sizeof(int), cudaMemcpyHostToDevice));
+    if (num_output_radials <= 0) return;
 
     // Clear output
-    CUDA_CHECK(cudaMemset(d_output, 0,
-                           (size_t)out_num_gates * valid_count * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0,
+                               (size_t)out_num_gates * num_output_radials * sizeof(uint16_t),
+                               stream));
 
     // Launch transpose kernel
     dim3 block(32, 8);
-    dim3 grid((out_num_gates + 31) / 32, (valid_count + 7) / 8);
+    dim3 grid((out_num_gates + 31) / 32, (num_output_radials + 7) / 8);
     transposeKernel<<<grid, block, 0, stream>>>(
-        d_raw_data, d_radials, d_indices, valid_count,
+        d_raw_data, d_radials, d_radial_indices, num_output_radials,
         product, d_output, out_num_gates);
 
     // Extract sorted azimuths
-    extractAzimuthsKernel<<<(valid_count + 255) / 256, 256, 0, stream>>>(
-        d_radials, d_indices, valid_count, d_azimuths_out);
-
-    cudaFree(d_indices);
+    extractAzimuthsKernel<<<(num_output_radials + 255) / 256, 256, 0, stream>>>(
+        d_radials, d_radial_indices, num_output_radials, d_azimuths_out);
 }
 
 // ── Full ingest pipeline ────────────────────────────────────
@@ -386,54 +388,78 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
                            num_parsed * sizeof(GpuParsedRadial),
                            cudaMemcpyDeviceToHost));
 
-    // Find the lowest elevation sweep's radials
-    // Group by elevation_number, pick the lowest
+    // Find the lowest elevation sweep's radials and distinct sweep count.
     float lowest_elev = 999.0f;
     int lowest_elev_num = -1;
+    std::array<bool, 256> seen_sweeps = {};
     for (auto& r : h_radials) {
         if (r.azimuth < 0) continue;
+        seen_sweeps[r.elevation_number] = true;
         if (r.elevation < lowest_elev) {
             lowest_elev = r.elevation;
             lowest_elev_num = r.elevation_number;
         }
     }
 
-    // Count radials in lowest sweep
-    int sweep_count = 0;
-    for (auto& r : h_radials) {
-        if (r.azimuth >= 0 && r.elevation_number == lowest_elev_num)
-            sweep_count++;
+    for (bool seen : seen_sweeps)
+        result.total_sweeps += seen ? 1 : 0;
+
+    if (lowest_elev_num < 0) {
+        cudaFreeAsync(d_raw, stream);
+        cudaFreeAsync(d_radials, stream);
+        return result;
     }
 
-    result.elevation_angle = lowest_elev;
-    result.num_radials = sweep_count;
+    std::vector<int> lowest_indices;
+    lowest_indices.reserve(num_parsed);
+    for (int i = 0; i < num_parsed; ++i) {
+        const auto& r = h_radials[i];
+        if (r.azimuth >= 0.0f && r.azimuth < 360.0f && r.elevation_number == lowest_elev_num)
+            lowest_indices.push_back(i);
+    }
+    std::sort(lowest_indices.begin(), lowest_indices.end(), [&](int a, int b) {
+        return h_radials[a].azimuth < h_radials[b].azimuth;
+    });
 
-    // Determine gate params from first valid radial in lowest sweep
-    for (auto& r : h_radials) {
-        if (r.azimuth < 0 || r.elevation_number != lowest_elev_num) continue;
+    result.elevation_angle = lowest_elev;
+    result.num_radials = (int)lowest_indices.size();
+    if (result.num_radials <= 0) {
+        cudaFreeAsync(d_raw, stream);
+        cudaFreeAsync(d_radials, stream);
+        return result;
+    }
+
+    // Determine gate params from the fullest radial carrying each product.
+    for (int radialIdx : lowest_indices) {
+        const auto& r = h_radials[radialIdx];
         for (int p = 0; p < NUM_PRODUCTS; p++) {
             if (r.moment_offsets[p] >= 0 && r.num_gates[p] > 0) {
-                result.has_product[p] = true;
-                result.num_gates[p] = r.num_gates[p];
-                result.first_gate_km[p] = r.first_gate[p] / 1000.0f;
-                result.gate_spacing_km[p] = r.gate_spacing[p] / 1000.0f;
-                result.scale[p] = r.scale[p];
-                result.offset[p] = r.offset[p];
+                if (!result.has_product[p] || r.num_gates[p] > result.num_gates[p]) {
+                    result.has_product[p] = true;
+                    result.num_gates[p] = r.num_gates[p];
+                    result.first_gate_km[p] = r.first_gate[p] / 1000.0f;
+                    result.gate_spacing_km[p] = r.gate_spacing[p] / 1000.0f;
+                    result.scale[p] = r.scale[p];
+                    result.offset[p] = r.offset[p];
+                }
             }
         }
-        break;
     }
 
     // Allocate output buffers
-    CUDA_CHECK(cudaMalloc(&result.d_azimuths, sweep_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&result.d_azimuths, result.num_radials * sizeof(float)));
+    int* d_indices = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_indices, result.num_radials * sizeof(int), stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_indices, lowest_indices.data(),
+                               result.num_radials * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
 
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (result.has_product[p]) {
-            size_t sz = (size_t)result.num_gates[p] * sweep_count * sizeof(uint16_t);
+            size_t sz = (size_t)result.num_gates[p] * result.num_radials * sizeof(uint16_t);
             CUDA_CHECK(cudaMalloc(&result.d_gates[p], sz));
 
-            // GPU transpose
-            transposeGatesGpu(d_raw, d_radials, num_parsed, p,
+            transposeGatesGpu(d_raw, d_radials, d_indices, result.num_radials, p,
                               result.d_gates[p], result.num_gates[p],
                               result.d_azimuths, stream);
         }
@@ -442,6 +468,7 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Cleanup temp buffers
+    cudaFreeAsync(d_indices, stream);
     cudaFreeAsync(d_raw, stream);
     cudaFreeAsync(d_radials, stream);
 

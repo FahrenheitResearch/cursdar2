@@ -8,6 +8,10 @@
 // Handles BZ2 decompression and message parsing.
 class Level2Parser {
 public:
+    // Decode an Archive II payload to the combined decompressed message stream.
+    // Returns empty on failure.
+    static std::vector<uint8_t> decodeArchiveBytes(const std::vector<uint8_t>& fileData);
+
     // Parse raw file bytes into structured radar data.
     // Returns empty data on failure.
     static ParsedRadarData parse(const std::vector<uint8_t>& fileData);

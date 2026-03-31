@@ -110,6 +110,8 @@ __device__ float gaussianFalloff(float dist, float sigma) {
 }
 
 __device__ int bsAz(const float* azimuths, int n, float target) {
+    if (n <= 0) return 0;
+    if (target > azimuths[n - 1]) return n;
     int lo = 0;
     int hi = n - 1;
     while (lo < hi) {
@@ -800,8 +802,12 @@ void buildVolume(int station_idx, int product,
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    float2* final_volume = d_volume_raw;
+    if (s_volumeQuality.smooth_passes > 0 && (s_volumeQuality.smooth_passes & 1))
+        final_volume = d_volume_scratch;
+
     cudaMemcpy3DParms copy_params = {};
-    copy_params.srcPtr = make_cudaPitchedPtr(d_volume_raw, VOL_XY * sizeof(float2), VOL_XY, VOL_XY);
+    copy_params.srcPtr = make_cudaPitchedPtr(final_volume, VOL_XY * sizeof(float2), VOL_XY, VOL_XY);
     copy_params.dstArray = d_volume_array;
     copy_params.extent = make_cudaExtent(VOL_XY, VOL_XY, VOL_Z);
     copy_params.kind = cudaMemcpyDeviceToDevice;

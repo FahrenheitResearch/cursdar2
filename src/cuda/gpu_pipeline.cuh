@@ -44,7 +44,8 @@ int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
 void transposeGatesGpu(
     const uint8_t* d_raw_data,        // raw file bytes on GPU
     const GpuParsedRadial* d_radials, // parsed radial info
-    int num_radials,
+    const int* d_radial_indices,      // sorted, sweep-local radial indices
+    int num_output_radials,
     int product,                       // which product to transpose
     uint16_t* d_output,               // output: gate-major [num_gates][num_radials]
     int out_num_gates,                // output gate count (uniform)
@@ -56,17 +57,19 @@ void transposeGatesGpu(
 // All on GPU, returns device pointers ready for the render kernel.
 
 struct GpuIngestResult {
-    float*    d_azimuths;
-    uint16_t* d_gates[NUM_PRODUCTS];
-    int       num_radials;
-    int       num_gates[NUM_PRODUCTS];
-    float     first_gate_km[NUM_PRODUCTS];
-    float     gate_spacing_km[NUM_PRODUCTS];
-    float     scale[NUM_PRODUCTS];
-    float     offset[NUM_PRODUCTS];
-    bool      has_product[NUM_PRODUCTS];
-    float     elevation_angle;
-    float     station_lat, station_lon;
+    float*    d_azimuths = nullptr;
+    uint16_t* d_gates[NUM_PRODUCTS] = {};
+    int       num_radials = 0;
+    int       num_gates[NUM_PRODUCTS] = {};
+    float     first_gate_km[NUM_PRODUCTS] = {};
+    float     gate_spacing_km[NUM_PRODUCTS] = {};
+    float     scale[NUM_PRODUCTS] = {};
+    float     offset[NUM_PRODUCTS] = {};
+    bool      has_product[NUM_PRODUCTS] = {};
+    float     elevation_angle = 0.0f;
+    float     station_lat = 0.0f;
+    float     station_lon = 0.0f;
+    int       total_sweeps = 0;
 };
 
 // Run full GPU ingest for one sweep's worth of raw data

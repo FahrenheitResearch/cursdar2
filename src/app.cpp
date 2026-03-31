@@ -492,58 +492,188 @@ void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
     }
 }
 
+bool parsedSweepHasProduct(const ParsedSweep& sweep, int product) {
+    for (const auto& radial : sweep.radials) {
+        for (const auto& moment : radial.moments) {
+            if (moment.product_index == product)
+                return true;
+        }
+    }
+    return false;
+}
+
+int findLowestParsedSweepIndex(const ParsedRadarData& parsed) {
+    int bestIdx = -1;
+    float bestElev = std::numeric_limits<float>::max();
+    int bestProducts = -1;
+    int bestRadials = -1;
+
+    for (int i = 0; i < (int)parsed.sweeps.size(); i++) {
+        const auto& sweep = parsed.sweeps[i];
+        if (sweep.radials.empty()) continue;
+
+        int productCount = 0;
+        for (int p = 0; p < NUM_PRODUCTS; p++)
+            productCount += parsedSweepHasProduct(sweep, p) ? 1 : 0;
+
+        if (bestIdx < 0 ||
+            sweep.elevation_angle < bestElev - 0.05f ||
+            (fabsf(sweep.elevation_angle - bestElev) <= 0.05f && productCount > bestProducts) ||
+            (fabsf(sweep.elevation_angle - bestElev) <= 0.05f && productCount == bestProducts &&
+             (int)sweep.radials.size() > bestRadials)) {
+            bestIdx = i;
+            bestElev = sweep.elevation_angle;
+            bestProducts = productCount;
+            bestRadials = (int)sweep.radials.size();
+        }
+    }
+
+    return bestIdx;
+}
+
+PrecomputedSweep buildPrecomputedSweep(const ParsedSweep& sweep) {
+    PrecomputedSweep pc;
+    pc.elevation_angle = sweep.elevation_angle;
+    pc.num_radials = (int)sweep.radials.size();
+    if (pc.num_radials == 0)
+        return pc;
+
+    pc.azimuths.resize(pc.num_radials);
+    for (int r = 0; r < pc.num_radials; r++)
+        pc.azimuths[r] = sweep.radials[r].azimuth;
+
+    for (const auto& radial : sweep.radials) {
+        for (const auto& moment : radial.moments) {
+            int p = moment.product_index;
+            if (p < 0 || p >= NUM_PRODUCTS) continue;
+            auto& pd = pc.products[p];
+            if (!pd.has_data || moment.num_gates > pd.num_gates) {
+                pd.has_data = true;
+                pd.num_gates = moment.num_gates;
+                pd.first_gate_km = moment.first_gate_m / 1000.0f;
+                pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
+                pd.scale = moment.scale;
+                pd.offset = moment.offset;
+            }
+        }
+    }
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        auto& pd = pc.products[p];
+        if (!pd.has_data || pd.num_gates <= 0) continue;
+
+        int ng = pd.num_gates;
+        int nr = pc.num_radials;
+        pd.gates.assign((size_t)ng * nr, 0);
+
+        for (int r = 0; r < nr; r++) {
+            for (const auto& mom : sweep.radials[r].moments) {
+                if (mom.product_index != p) continue;
+                int gc = std::min((int)mom.gates.size(), ng);
+                for (int g = 0; g < gc; g++)
+                    pd.gates[(size_t)g * nr + r] = mom.gates[g];
+                break;
+            }
+        }
+    }
+
+    return pc;
+}
+
 std::vector<PrecomputedSweep> buildPrecomputedSweeps(const ParsedRadarData& parsed) {
     std::vector<PrecomputedSweep> precomp;
     precomp.resize(parsed.sweeps.size());
 
     for (int si = 0; si < (int)parsed.sweeps.size(); si++) {
-        const auto& sweep = parsed.sweeps[si];
-        auto& pc = precomp[si];
-        pc.elevation_angle = sweep.elevation_angle;
-        pc.num_radials = (int)sweep.radials.size();
-        if (pc.num_radials == 0) continue;
-
-        pc.azimuths.resize(pc.num_radials);
-        for (int r = 0; r < pc.num_radials; r++)
-            pc.azimuths[r] = sweep.radials[r].azimuth;
-
-        for (const auto& radial : sweep.radials) {
-            for (const auto& moment : radial.moments) {
-                int p = moment.product_index;
-                if (p < 0 || p >= NUM_PRODUCTS) continue;
-                auto& pd = pc.products[p];
-                if (!pd.has_data || moment.num_gates > pd.num_gates) {
-                    pd.has_data = true;
-                    pd.num_gates = moment.num_gates;
-                    pd.first_gate_km = moment.first_gate_m / 1000.0f;
-                    pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
-                    pd.scale = moment.scale;
-                    pd.offset = moment.offset;
-                }
-            }
-        }
-
-        for (int p = 0; p < NUM_PRODUCTS; p++) {
-            auto& pd = pc.products[p];
-            if (!pd.has_data || pd.num_gates <= 0) continue;
-
-            int ng = pd.num_gates;
-            int nr = pc.num_radials;
-            pd.gates.assign((size_t)ng * nr, 0);
-
-            for (int r = 0; r < nr; r++) {
-                for (const auto& mom : sweep.radials[r].moments) {
-                    if (mom.product_index != p) continue;
-                    int gc = std::min((int)mom.gates.size(), ng);
-                    for (int g = 0; g < gc; g++)
-                        pd.gates[(size_t)g * nr + r] = mom.gates[g];
-                    break;
-                }
-            }
-        }
+        precomp[si] = buildPrecomputedSweep(parsed.sweeps[si]);
     }
 
     return precomp;
+}
+
+std::vector<PrecomputedSweep> buildReducedWorkingSetSweeps(const ParsedRadarData& parsed) {
+    std::vector<int> selected;
+    const int lowestIdx = findLowestParsedSweepIndex(parsed);
+    if (lowestIdx >= 0)
+        selected.push_back(lowestIdx);
+
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        for (int i = 0; i < (int)parsed.sweeps.size(); ++i) {
+            const auto& sweep = parsed.sweeps[i];
+            if (sweep.elevation_angle > 1.5f)
+                continue;
+            if (!parsedSweepHasProduct(sweep, p))
+                continue;
+            if (std::find(selected.begin(), selected.end(), i) == selected.end())
+                selected.push_back(i);
+            break;
+        }
+    }
+
+    std::sort(selected.begin(), selected.end(), [&](int a, int b) {
+        const auto& sa = parsed.sweeps[a];
+        const auto& sb = parsed.sweeps[b];
+        if (fabsf(sa.elevation_angle - sb.elevation_angle) > 0.05f)
+            return sa.elevation_angle < sb.elevation_angle;
+        return sa.sweep_number < sb.sweep_number;
+    });
+
+    std::vector<PrecomputedSweep> sweeps;
+    sweeps.reserve(selected.size());
+    for (int idx : selected)
+        sweeps.push_back(buildPrecomputedSweep(parsed.sweeps[idx]));
+    return sweeps;
+}
+
+struct FastLowestSweepWorkingSet {
+    std::vector<PrecomputedSweep> sweeps;
+    int total_sweeps = 0;
+    bool success = false;
+};
+
+FastLowestSweepWorkingSet buildFastLowestSweepWorkingSetGpu(const std::vector<uint8_t>& archiveData) {
+    FastLowestSweepWorkingSet workingSet;
+    if (archiveData.empty())
+        return workingSet;
+
+    auto decoded = Level2Parser::decodeArchiveBytes(archiveData);
+    if (decoded.empty())
+        return workingSet;
+
+    auto ingest = gpu_pipeline::ingestSweepGpu(decoded.data(), decoded.size());
+    if (!ingest.d_azimuths || ingest.num_radials <= 0) {
+        gpu_pipeline::freeIngestResult(ingest);
+        return workingSet;
+    }
+
+    PrecomputedSweep sweep;
+    sweep.elevation_angle = ingest.elevation_angle;
+    sweep.num_radials = ingest.num_radials;
+    sweep.azimuths.resize(ingest.num_radials);
+    CUDA_CHECK(cudaMemcpy(sweep.azimuths.data(), ingest.d_azimuths,
+                          ingest.num_radials * sizeof(float), cudaMemcpyDeviceToHost));
+
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        if (!ingest.has_product[p] || !ingest.d_gates[p] || ingest.num_gates[p] <= 0)
+            continue;
+
+        auto& pd = sweep.products[p];
+        pd.has_data = true;
+        pd.num_gates = ingest.num_gates[p];
+        pd.first_gate_km = ingest.first_gate_km[p];
+        pd.gate_spacing_km = ingest.gate_spacing_km[p];
+        pd.scale = ingest.scale[p];
+        pd.offset = ingest.offset[p];
+        pd.gates.resize((size_t)pd.num_gates * ingest.num_radials);
+        CUDA_CHECK(cudaMemcpy(pd.gates.data(), ingest.d_gates[p],
+                              pd.gates.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    }
+
+    gpu_pipeline::freeIngestResult(ingest);
+    workingSet.total_sweeps = std::max(ingest.total_sweeps, 1);
+    workingSet.sweeps.push_back(std::move(sweep));
+    workingSet.success = true;
+    return workingSet;
 }
 
 void dealiasPrecomputedSweeps(std::vector<PrecomputedSweep>& sweeps) {
@@ -2471,13 +2601,82 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
                              bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
                              const std::string& volumeKey) {
     if (!isCurrentDownloadGeneration(generation)) return false;
+
+    bool keepFull = snapshotMode || m_historicMode;
+    if (!keepFull) {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        keepFull = shouldKeepStationFullVolumeLocked(stationIdx, m_activeStationIdx);
+    }
+
+    const bool preferFastLowestSweep = (snapshotMode && lowestSweepOnly) || (!keepFull && !m_historicMode);
+    if (preferFastLowestSweep) {
+        auto fastWorkingSet = buildFastLowestSweepWorkingSetGpu(data);
+        if (fastWorkingSet.success && !fastWorkingSet.sweeps.empty()) {
+            std::vector<PrecomputedSweep> precomp = std::move(fastWorkingSet.sweeps);
+            if (dealiasEnabled)
+                dealiasPrecomputedSweeps(precomp);
+            if (snapshotMode)
+                suppressReflectivityRingArtifacts(precomp);
+
+            const float detectionLat = NEXRAD_STATIONS[stationIdx].lat;
+            const float detectionLon = NEXRAD_STATIONS[stationIdx].lon;
+            Detection detection = computeDetectionForSweeps(precomp, detectionLat, detectionLon,
+                                                            NEXRAD_STATIONS[stationIdx].icao);
+
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                if (!isCurrentDownloadGeneration(generation)) return false;
+                auto& st = m_stations[stationIdx];
+                if (!snapshotMode && !m_historicMode && !st.enabled) {
+                    if (st.downloading) {
+                        st.downloading = false;
+                        if (m_stationsDownloading.load() > 0)
+                            m_stationsDownloading--;
+                    }
+                    return true;
+                }
+                st.raw_volume_data = std::move(data);
+                st.total_sweeps = fastWorkingSet.total_sweeps;
+                st.lowest_sweep_elev = precomp.front().elevation_angle;
+                st.lowest_sweep_radials = precomp.front().num_radials;
+                st.data_lat = detectionLat;
+                st.data_lon = detectionLon;
+                st.precomputed = std::move(precomp);
+                st.full_volume_resident = false;
+                st.parsed = true;
+                st.failed = false;
+                st.error.clear();
+                st.detection = std::move(detection);
+                if (!snapshotMode && !m_historicMode)
+                    appendLiveHistoryLocked(st, volumeKey, st.precomputed, detectionLat, detectionLon);
+                if (st.downloading) {
+                    st.downloading = false;
+                    m_stationsDownloading--;
+                }
+                st.lastUpdate = std::chrono::steady_clock::now();
+                st.latestVolumeKey = volumeKey;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_uploadMutex);
+                if (isCurrentDownloadGeneration(generation))
+                    m_uploadQueue.push_back(stationIdx);
+            }
+            if (!snapshotMode && !m_historicMode)
+                trimLiveHistoryWorkingSet(m_activeStationIdx);
+            return true;
+        }
+    }
+
     auto parsed = Level2Parser::parse(data);
 
     if (parsed.sweeps.empty()) {
         return false;
     }
 
-    std::vector<PrecomputedSweep> precomp = buildPrecomputedSweeps(parsed);
+    std::vector<PrecomputedSweep> precomp = keepFull
+        ? buildPrecomputedSweeps(parsed)
+        : buildReducedWorkingSetSweeps(parsed);
     if (dealiasEnabled)
         dealiasPrecomputedSweeps(precomp);
     const float detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : NEXRAD_STATIONS[stationIdx].lat;
@@ -2517,7 +2716,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         st.data_lat = parsed.station_lat;
         st.data_lon = parsed.station_lon;
         st.precomputed = std::move(precomp);
-        st.full_volume_resident = true;
+        st.full_volume_resident = keepFull && !(snapshotMode && lowestSweepOnly);
         st.parsed = true;
         st.failed = false;
         st.error.clear();
@@ -2531,8 +2730,6 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         st.lastUpdate = std::chrono::steady_clock::now();
         st.latestVolumeKey = volumeKey;
 
-        const bool keepFull = snapshotMode ||
-            shouldKeepStationFullVolumeLocked(stationIdx, m_activeStationIdx);
         if (!keepFull)
             trimStationToLowestSweepLocked(st);
     }

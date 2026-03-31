@@ -343,6 +343,8 @@ static void uploadColorTables() {
 // No intermediate textures. Resolution = viewport resolution at any zoom.
 
 __device__ int bsearchAz(const float* az, int n, float target) {
+    if (n <= 0) return 0;
+    if (target > az[n - 1]) return n;
     int lo = 0, hi = n - 1;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
