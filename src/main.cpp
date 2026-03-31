@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <chrono>
+#include <thread>
 
 // ── Globals for callbacks ───────────────────────────────────
 static App* g_app = nullptr;
@@ -19,6 +20,7 @@ static bool g_mouseDown = false;
 static bool g_rightMouseDown = false;
 static bool g_middleMouseDown = false;
 static double g_lastMouseX = 0, g_lastMouseY = 0;
+static double g_leftMouseDownX = 0, g_leftMouseDownY = 0;
 
 static void scrollCallback(GLFWwindow* window, double xoff, double yoff) {
     if (ImGui::GetIO().WantCaptureMouse) return;
@@ -27,6 +29,12 @@ static void scrollCallback(GLFWwindow* window, double xoff, double yoff) {
 
 static void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     if (g_app && width > 0 && height > 0) {
+        g_app->onFramebufferResize(width, height);
+    }
+}
+
+static void windowSizeCallback(GLFWwindow* window, int width, int height) {
+    if (g_app && width > 0 && height > 0) {
         g_app->onResize(width, height);
     }
 }
@@ -34,6 +42,9 @@ static void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
 int main(int argc, char** argv) {
     printf("=== CURSDAR2 - CUDA Radar Workstation ===\n");
     printf("Loading next-generation shell on the CUDA radar engine\n\n");
+#ifdef _WIN32
+    SetProcessDPIAware();
+#endif
 
     // ── GLFW init ───────────────────────────────────────────
     if (!glfwInit()) {
@@ -62,9 +73,41 @@ int main(int argc, char** argv) {
     glfwSwapInterval(0); // No vsync - maximum frame rate
     glfwSetScrollCallback(window, scrollCallback);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
 
-    // Get actual framebuffer size
-    glfwGetFramebufferSize(window, &winW, &winH);
+    auto syncWindowMetrics = [&](int& logicalW, int& logicalH, int& framebufferW, int& framebufferH) {
+        glfwGetWindowSize(window, &logicalW, &logicalH);
+        glfwGetFramebufferSize(window, &framebufferW, &framebufferH);
+        if (logicalW <= 0 || logicalH <= 0) {
+            logicalW = (framebufferW > 0) ? framebufferW : 1;
+            logicalH = (framebufferH > 0) ? framebufferH : 1;
+        }
+        if (framebufferW <= 0 || framebufferH <= 0) {
+            framebufferW = logicalW;
+            framebufferH = logicalH;
+        }
+    };
+
+    auto settleWindowMetrics = [&](int& logicalW, int& logicalH, int& framebufferW, int& framebufferH) {
+        int lastFramebufferW = -1;
+        int lastFramebufferH = -1;
+        for (int attempt = 0; attempt < 6; attempt++) {
+            glfwPollEvents();
+            syncWindowMetrics(logicalW, logicalH, framebufferW, framebufferH);
+            if (framebufferW > 0 && framebufferH > 0 &&
+                framebufferW == lastFramebufferW &&
+                framebufferH == lastFramebufferH) {
+                break;
+            }
+            lastFramebufferW = framebufferW;
+            lastFramebufferH = framebufferH;
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    };
+
+    int fbW = winW;
+    int fbH = winH;
+    settleWindowMetrics(winW, winH, fbW, fbH);
 
     // ── Dear ImGui init ─────────────────────────────────────
     IMGUI_CHECKVERSION();
@@ -85,11 +128,14 @@ int main(int argc, char** argv) {
     App app;
     g_app = &app;
 
-    if (!app.init(winW, winH)) {
+    if (!app.init(winW, winH, fbW, fbH)) {
         fprintf(stderr, "Failed to initialize app\n");
         g_app = nullptr;
         exitCode = 1;
     } else {
+        settleWindowMetrics(winW, winH, fbW, fbH);
+        app.onResize(winW, winH);
+        app.onFramebufferResize(fbW, fbH);
         printf("Starting main loop...\n");
 
     // ── Main loop ───────────────────────────────────────────
@@ -100,6 +146,15 @@ int main(int argc, char** argv) {
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+        int currentWinW = 0;
+        int currentWinH = 0;
+        int currentFbW = 0;
+        int currentFbH = 0;
+        syncWindowMetrics(currentWinW, currentWinH, currentFbW, currentFbH);
+        if (currentWinW != app.viewport().width || currentWinH != app.viewport().height)
+            app.onResize(currentWinW, currentWinH);
+        if (currentFbW != app.framebufferWidth() || currentFbH != app.framebufferHeight())
+            app.onFramebufferResize(currentFbW, currentFbH);
 
         // Calculate delta time
         auto now = std::chrono::steady_clock::now();
@@ -138,8 +193,22 @@ int main(int argc, char** argv) {
             if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
                 if (g_mouseDown)
                     app.onMouseDrag(mx - g_lastMouseX, my - g_lastMouseY);
+                else {
+                    g_leftMouseDownX = mx;
+                    g_leftMouseDownY = my;
+                }
                 g_mouseDown = true;
             } else {
+                if (g_mouseDown && !app.crossSection() && !app.mode3D()) {
+                    const double clickDx = mx - g_leftMouseDownX;
+                    const double clickDy = my - g_leftMouseDownY;
+                    const double clickDistSq = clickDx * clickDx + clickDy * clickDy;
+                    if (clickDistSq <= 36.0) {
+                        const int hitIdx = app.stationAtScreen(mx, my);
+                        if (hitIdx >= 0)
+                            app.selectStation(hitIdx, false);
+                    }
+                }
                 g_mouseDown = false;
             }
             if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
@@ -183,7 +252,7 @@ int main(int argc, char** argv) {
 
         ImGui::Render();
 
-        glViewport(0, 0, app.viewport().width, app.viewport().height);
+        glViewport(0, 0, app.framebufferWidth(), app.framebufferHeight());
         glClearColor(0.05f, 0.05f, 0.07f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 

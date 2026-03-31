@@ -259,6 +259,7 @@ void init() {
 
 void render(App& app) {
     auto& vp = app.viewport();
+    ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const auto stations = app.stations();
     const auto warnings = app.currentWarnings();
     static char palettePath[512] = "";
@@ -288,8 +289,9 @@ void render(App& app) {
     auto* drawList = ImGui::GetBackgroundDrawList();
     drawList->AddImage(
         (ImTextureID)(uintptr_t)app.outputTexture().textureId(),
-        ImVec2(0, 0),
-        ImVec2((float)vp.width, (float)vp.height));
+        mainViewport->Pos,
+        ImVec2(mainViewport->Pos.x + mainViewport->Size.x,
+               mainViewport->Pos.y + mainViewport->Size.y));
 
     // ── State boundaries ─────────────────────────────────────
     {
@@ -444,6 +446,10 @@ void render(App& app) {
         } else {
             ImGui::SameLine(430);
             ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "LIVE");
+            if (app.liveLoopViewingHistory()) {
+                ImGui::SameLine(500);
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "LOOP");
+            }
         }
     }
     ImGui::SameLine(650);
@@ -517,6 +523,24 @@ void render(App& app) {
     if (ImGui::Checkbox("Auto Track Nearest Site", &autoTrack))
         app.setAutoTrackStation(autoTrack);
 
+    if (ImGui::CollapsingHeader("Radar Activation", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Enabled Sites: %d / %d", app.enabledStationCount(), app.stationsTotal());
+        ImGui::TextWrapped("Gray map sites are idle. Click a site in the browser or on the map to enable it.");
+        const int activeIdx = app.activeStation();
+        if (activeIdx >= 0 && activeIdx < NUM_NEXRAD_STATIONS) {
+            const bool enabled = app.stationEnabled(activeIdx);
+            if (ImGui::Button(enabled ? "Disable Active Site" : "Enable Active Site", ImVec2(210, 24)))
+                app.setStationEnabled(activeIdx, !enabled);
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Button("Enable Active Site", ImVec2(210, 24));
+            ImGui::EndDisabled();
+        }
+        if (ImGui::Button("Disable All Sites", ImVec2(210, 24)))
+            app.disableAllStations();
+        ImGui::Separator();
+    }
+
     if (ImGui::Button(app.mode3D() ? "Exit 3D (V)" : "3D Volume (V)", ImVec2(210, 24)))
         app.toggle3D();
     if (ImGui::Button(app.crossSection() ? "Close Cross Section (X)" : "Cross Section (X)", ImVec2(210, 24)))
@@ -567,12 +591,49 @@ void render(App& app) {
         ImGui::Text("Process RAM: %s", formatBytes(mem.process_working_set_bytes).c_str());
         ImGui::Text("Process Peak: %s", formatBytes(mem.process_peak_working_set_bytes).c_str());
         ImGui::Text("Archive Cache: %s", formatBytes(mem.historic_cache_bytes).c_str());
+        ImGui::Text("Live Loop Cache: %s", formatBytes(mem.live_loop_bytes).c_str());
         ImGui::Text("3D Volume Working Set: %s", formatBytes(mem.volume_working_set_bytes).c_str());
         if (ImGui::Button("Reset Memory Peaks", ImVec2(210, 24)))
             app.resetMemoryPeaks();
     }
 
     ImGui::Separator();
+
+    if (!app.m_historicMode && !app.snapshotMode() &&
+        ImGui::CollapsingHeader("Live Loop", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool liveLoopEnabled = app.liveLoopEnabled();
+        if (ImGui::Checkbox("Enable Realtime Loop", &liveLoopEnabled))
+            app.setLiveLoopEnabled(liveLoopEnabled);
+
+        ImGui::BeginDisabled(!liveLoopEnabled);
+        int loopFrames = app.liveLoopLength();
+        if (ImGui::SliderInt("Loop Frames", &loopFrames, 1, app.liveLoopMaxFrames()))
+            app.setLiveLoopLength(loopFrames);
+
+        float loopSpeed = app.liveLoopSpeed();
+        if (ImGui::SliderFloat("Loop FPS", &loopSpeed, 1.0f, 15.0f, "%.0f fps"))
+            app.setLiveLoopSpeed(loopSpeed);
+
+        if (ImGui::Button(app.liveLoopPlaying() ? "Pause Loop" : "Play Loop", ImVec2(102, 24)))
+            app.toggleLiveLoopPlayback();
+        ImGui::SameLine();
+        if (ImGui::Button("Jump Live", ImVec2(102, 24)))
+            app.setLiveLoopPlaybackFrame(app.liveLoopAvailableFrames() > 0
+                ? app.liveLoopAvailableFrames() - 1
+                : 0);
+
+        ImGui::Text("Cached Frames: %d / %d",
+                    app.liveLoopAvailableFrames(), app.liveLoopLength());
+        std::string liveLoopLabel = app.liveLoopCurrentLabel();
+        if (!liveLoopLabel.empty())
+            ImGui::TextWrapped("%s", liveLoopLabel.c_str());
+        if (app.mode3D() || app.crossSection())
+            ImGui::TextDisabled("Realtime loop playback is 2D-only.");
+        if (ImGui::Button("Clear Loop", ImVec2(210, 24)))
+            app.clearLiveLoop();
+        ImGui::EndDisabled();
+        ImGui::Separator();
+    }
 
     if (app.activeProduct() == PROD_VEL) {
         bool srv = app.srvMode();
@@ -798,6 +859,36 @@ void render(App& app) {
         ImGui::End();
     }
 
+    if (!app.m_historicMode && !app.snapshotMode() && app.liveLoopEnabled()) {
+        ImGui::SetNextWindowSize(ImVec2(640, 160), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Realtime Loop");
+
+        if (app.liveLoopAvailableFrames() <= 0) {
+            ImGui::TextDisabled("Waiting for live frames...");
+        } else {
+            std::string liveLoopLabel = app.liveLoopCurrentLabel();
+            ImGui::Text("%s", liveLoopLabel.empty() ? "Realtime Loop" : liveLoopLabel.c_str());
+
+            if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play", ImVec2(60, 20)))
+                app.toggleLiveLoopPlayback();
+            ImGui::SameLine();
+            if (ImGui::Button("Live", ImVec2(60, 20)))
+                app.setLiveLoopPlaybackFrame(app.liveLoopAvailableFrames() - 1);
+            ImGui::SameLine();
+            float loopSpeed = app.liveLoopSpeed();
+            ImGui::SetNextItemWidth(90);
+            if (ImGui::SliderFloat("##live_loop_spd", &loopSpeed, 1.0f, 15.0f, "%.0f fps"))
+                app.setLiveLoopSpeed(loopSpeed);
+
+            int liveFrame = app.liveLoopPlaybackFrame();
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::SliderInt("##live_loop_frame", &liveFrame, 0, app.liveLoopAvailableFrames() - 1))
+                app.setLiveLoopPlaybackFrame(liveFrame);
+        }
+
+        ImGui::End();
+    }
+
     // ── Station list (right panel, hide in historic mode) ──
     if (app.m_historicMode) goto skip_station_list;
 
@@ -820,22 +911,31 @@ void render(App& app) {
         if (!containsCaseInsensitive(searchBlob, stationFilter)) continue;
 
         ImVec4 color;
-        if (st.rendered)      color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
-        else if (st.uploaded) color = ImVec4(0.8f, 0.8f, 0.3f, 1.0f);
-        else if (st.parsed)   color = ImVec4(0.3f, 0.7f, 1.0f, 1.0f);
-        else if (st.downloading) color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-        else if (st.failed)   color = ImVec4(1.0f, 0.3f, 0.3f, 0.8f);
-        else                  color = ImVec4(0.4f, 0.4f, 0.4f, 1.0f);
+        if (!st.enabled)          color = ImVec4(0.42f, 0.42f, 0.46f, 1.0f);
+        else if (st.rendered)     color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
+        else if (st.uploaded)     color = ImVec4(0.8f, 0.8f, 0.3f, 1.0f);
+        else if (st.parsed)       color = ImVec4(0.3f, 0.7f, 1.0f, 1.0f);
+        else if (st.downloading)  color = ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+        else if (st.failed)       color = ImVec4(1.0f, 0.3f, 0.3f, 0.8f);
+        else                      color = ImVec4(0.6f, 0.6f, 0.66f, 1.0f);
+
+        ImGui::PushID(i);
+        bool enabled = st.enabled;
+        if (ImGui::Checkbox("##enabled", &enabled))
+            app.setStationEnabled(i, enabled);
+        ImGui::SameLine();
 
         std::string label = st.icao + "  " + NEXRAD_STATIONS[i].name;
         ImGui::PushStyleColor(ImGuiCol_Text, color);
         if (ImGui::Selectable(label.c_str(), i == app.activeStation()))
             app.selectStation(i, true, 200.0);
         ImGui::PopStyleColor();
+        ImGui::PopID();
 
         if (ImGui::IsItemHovered()) {
             ImGui::BeginTooltip();
             ImGui::Text("%s (%s)", NEXRAD_STATIONS[i].name, NEXRAD_STATIONS[i].state);
+            ImGui::Text("%s", st.enabled ? "Enabled for live refresh" : "Disabled / idle");
             ImGui::Text("Lat: %.4f  Lon: %.4f", st.display_lat, st.display_lon);
             if (!st.latest_scan_utc.empty())
                 ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
@@ -874,7 +974,7 @@ void render(App& app) {
     ImGui::Text("Threshold: %.1f %s",
                 app.dbzMinThreshold(),
                 app.activeProduct() == PROD_VEL ? "m/s" : "dBZ");
-    ImGui::Text("Stations: %d/%d loaded", app.stationsLoaded(), app.stationsTotal());
+    ImGui::Text("Stations: %d enabled | %d loaded", app.enabledStationCount(), app.stationsLoaded());
     ImGui::Text("Downloads: %d", app.stationsDownloading());
     ImGui::Text("Alerts: %d", warningCount);
     const auto& mem = app.memoryTelemetry();
@@ -899,9 +999,15 @@ void render(App& app) {
                     st.icao.c_str(),
                     NEXRAD_STATIONS[inspectorStation].name,
                     NEXRAD_STATIONS[inspectorStation].state);
+        ImGui::SameLine();
+        ImGui::TextColored(st.enabled ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                                      : ImVec4(0.7f, 0.7f, 0.74f, 1.0f),
+                           st.enabled ? "[ENABLED]" : "[DISABLED]");
         ImGui::Text("Lat %.4f  Lon %.4f", st.display_lat, st.display_lon);
         if (!st.latest_scan_utc.empty())
             ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
+        if (ImGui::Button(st.enabled ? "Disable Site" : "Enable Site", ImVec2(210, 24)))
+            app.setStationEnabled(inspectorStation, !st.enabled);
         ImGui::Text("Sweeps: %d", st.sweep_count);
         ImGui::Text("TDS %d  Hail %d  Meso %d",
                     (int)st.detection.tds.size(),
@@ -982,7 +1088,6 @@ void render(App& app) {
 
         for (int i = 0; i < (int)stations.size(); i++) {
             const auto& st = stations[i];
-            if (!st.uploaded && !st.parsed) continue;
 
             // Convert lat/lon to screen pixel
             float px = (float)((st.display_lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
@@ -996,15 +1101,18 @@ void render(App& app) {
             float boxW = 36, boxH = 14;
 
             // Background rectangle
-            ImU32 bgCol = isActive ?
-                IM_COL32(0, 180, 80, 220) :  // green for active
-                IM_COL32(40, 40, 50, 180);    // dark for others
-            ImU32 borderCol = isActive ?
-                IM_COL32(100, 255, 150, 255) :
-                IM_COL32(80, 80, 100, 200);
-            ImU32 textCol = isActive ?
-                IM_COL32(255, 255, 255, 255) :
-                IM_COL32(180, 180, 200, 220);
+            ImU32 bgCol;
+            ImU32 borderCol;
+            ImU32 textCol;
+            if (!st.enabled) {
+                bgCol = isActive ? IM_COL32(95, 95, 105, 220) : IM_COL32(52, 52, 58, 170);
+                borderCol = isActive ? IM_COL32(185, 185, 195, 255) : IM_COL32(96, 96, 104, 190);
+                textCol = IM_COL32(185, 185, 195, 230);
+            } else {
+                bgCol = isActive ? IM_COL32(0, 180, 80, 220) : IM_COL32(40, 40, 50, 180);
+                borderCol = isActive ? IM_COL32(100, 255, 150, 255) : IM_COL32(80, 80, 100, 200);
+                textCol = isActive ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 180, 200, 220);
+            }
 
             ImVec2 tl(px - boxW * 0.5f, py - boxH * 0.5f);
             ImVec2 br(px + boxW * 0.5f, py + boxH * 0.5f);
@@ -1179,6 +1287,8 @@ void render(App& app) {
         if (ImGui::IsKeyPressed(ImGuiKey_Home)) resetConusView(app);
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) app.setAutoTrackStation(true);
         if (app.m_historicMode && ImGui::IsKeyPressed(ImGuiKey_Space)) app.m_historic.togglePlay();
+        else if (!app.m_historicMode && app.liveLoopEnabled() && ImGui::IsKeyPressed(ImGuiKey_Space))
+            app.toggleLiveLoopPlayback();
     }
 }
 

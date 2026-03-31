@@ -11,12 +11,14 @@
 #include "net/warnings.h"
 #include "historic.h"
 #include <vector>
+#include <deque>
 #include <string>
 #include <mutex>
 #include <atomic>
 #include <memory>
 #include <chrono>
 #include <cstddef>
+#include <unordered_set>
 
 #include "nexrad/sweep_data.h"
 
@@ -30,11 +32,20 @@ struct Detection {
     bool computed = false;
 };
 
+struct LiveVolumeHistoryEntry {
+    std::string volume_key;
+    std::string label;
+    std::vector<PrecomputedSweep> sweeps;
+    float station_lat = 0.0f;
+    float station_lon = 0.0f;
+};
+
 // Per-station state
 struct StationState {
     int          index;
     std::string  icao;
     float        lat, lon;
+    bool         enabled = false;
     bool         downloading = false;
     bool         parsed = false;
     bool         uploaded = false;
@@ -54,6 +65,7 @@ struct StationState {
     std::chrono::steady_clock::time_point lastPollAttempt;
     std::string  latestVolumeKey;
     Detection detection;
+    std::deque<LiveVolumeHistoryEntry> live_history;
     int uploaded_product = -1;
     int uploaded_tilt = -1;
     int uploaded_sweep = -1;
@@ -66,6 +78,9 @@ struct StationUiState {
     float        lat = 0.0f, lon = 0.0f;
     float        display_lat = 0.0f, display_lon = 0.0f;
     std::string  latest_scan_utc;
+    bool         enabled = false;
+    bool         pinned = false;
+    bool         priority_hot = false;
     bool         downloading = false;
     bool         parsed = false;
     bool         uploaded = false;
@@ -93,10 +108,31 @@ struct MemoryTelemetry {
     size_t process_working_set_bytes = 0;
     size_t process_peak_working_set_bytes = 0;
     size_t historic_cache_bytes = 0;
+    size_t live_loop_bytes = 0;
     size_t volume_working_set_bytes = 0;
     int internal_render_width = 0;
     int internal_render_height = 0;
     float render_scale = 1.0f;
+};
+
+struct LiveLoopBackfillFrame {
+    std::string label;
+    std::vector<PrecomputedSweep> sweeps;
+    float station_lat = 0.0f;
+    float station_lon = 0.0f;
+};
+
+struct ProbSevereObject {
+    std::string id;
+    float lat = 0.0f;
+    float lon = 0.0f;
+    float prob_severe = 0.0f;
+    float prob_tor = 0.0f;
+    float prob_hail = 0.0f;
+    float prob_wind = 0.0f;
+    float motion_east = 0.0f;
+    float motion_south = 0.0f;
+    float avg_beam_height_km = 0.0f;
 };
 
 class App {
@@ -105,7 +141,8 @@ public:
     ~App();
 
     // Initialize GPU, start downloads
-    bool init(int windowWidth, int windowHeight);
+    bool init(int windowWidth, int windowHeight,
+              int framebufferWidth, int framebufferHeight);
 
     // Main update loop (called each frame)
     void update(float dt);
@@ -118,9 +155,11 @@ public:
     void onMouseDrag(double dx, double dy);
     void onMouseMove(double mx, double my);
     void onResize(int w, int h);
+    void onFramebufferResize(int w, int h);
 
     // Active station (nearest to mouse)
     int  activeStation() const { return m_activeStationIdx; }
+    int  stationAtScreen(double mx, double my, float radiusPx = 24.0f) const;
     std::string activeStationName() const;
     void selectStation(int idx, bool centerView = false, double zoom = -1.0);
     bool showAll() const { return m_showAll; }
@@ -157,6 +196,8 @@ public:
     int             stationsTotal() const { return m_stationsTotal; }
     int             stationsDownloading() const { return m_stationsDownloading.load(); }
     GlCudaTexture&  outputTexture() { return m_outputTex; }
+    int             framebufferWidth() const { return m_windowWidth; }
+    int             framebufferHeight() const { return m_windowHeight; }
     bool            autoTrackStation() const { return m_autoTrackStation; }
     void            setAutoTrackStation(bool enabled) { m_autoTrackStation = enabled; }
     float           cursorLat() const { return m_mouseLat; }
@@ -172,6 +213,31 @@ public:
     void            resetColorTable(int product = -1);
     const std::string& colorTableStatus() const { return m_colorTableStatus; }
     const std::string& colorTableLabel(int product) const { return m_colorTableLabels[product]; }
+    bool            liveLoopEnabled() const { return m_liveLoopEnabled; }
+    void            setLiveLoopEnabled(bool enabled);
+    bool            liveLoopPlaying() const { return m_liveLoopPlaying; }
+    void            toggleLiveLoopPlayback();
+    int             liveLoopLength() const { return m_liveLoopLength; }
+    void            setLiveLoopLength(int frames);
+    int             liveLoopMaxFrames() const { return MAX_LIVE_LOOP_FRAMES; }
+    int             liveLoopAvailableFrames() const { return m_liveLoopCount; }
+    int             liveLoopPlaybackFrame() const { return m_liveLoopPlaybackIndex; }
+    void            setLiveLoopPlaybackFrame(int index);
+    float           liveLoopSpeed() const { return m_liveLoopSpeed; }
+    void            setLiveLoopSpeed(float fps);
+    bool            liveLoopViewingHistory() const;
+    std::string     liveLoopCurrentLabel() const;
+    void            clearLiveLoop();
+    bool            stationEnabled(int idx) const;
+    void            setStationEnabled(int idx, bool enabled);
+    int             enabledStationCount() const;
+    void            disableAllStations();
+    bool            stationPinned(int idx) const;
+    void            setStationPinned(int idx, bool pinned);
+    bool            stationPriorityHot(int idx) const;
+    int             pinnedStationCount() const;
+    int             bootstrapStationTarget() const { return m_bootstrapStationTarget; }
+    std::string     priorityStatus() const;
 
     // Navigation: arrow keys
     void nextProduct();
@@ -240,6 +306,28 @@ private:
     int renderHeight() const;
     int historicFrameCacheLimit() const;
     bool historicFrameCachingEnabled() const;
+    void invalidateLiveLoop(bool freeMemory = false);
+    void requestLiveLoopCapture();
+    void updateLiveLoop(float dt);
+    void captureLiveLoopFrame(const uint32_t* d_src, int w, int h, const std::string& label);
+    int liveLoopSlotForIndex(int index) const;
+    std::string currentLiveLoopCaptureLabel() const;
+    void requestLiveLoopBackfill();
+    void processLiveLoopBackfill();
+    void resetLiveLoopFrameCache(bool freeMemory);
+    int stationLiveHistoryLimitLocked(int stationIdx) const;
+    void appendLiveHistoryLocked(StationState& st, const std::string& volumeKey,
+                                 const std::vector<PrecomputedSweep>& sweeps,
+                                 float stationLat, float stationLon);
+    void trimLiveHistoryWorkingSet(int focusIdx);
+    void requestProbSevereRefresh(bool force = false);
+    void updatePriorityStationsFromProbSevere(std::vector<ProbSevereObject> objects,
+                                              std::string status);
+    std::vector<int> buildPrioritySeedStations(int targetCount) const;
+    std::vector<int> buildSpatialFallbackStations(int targetCount,
+                                                  const std::vector<int>& seed) const;
+    float priorityScoreForStation(int stationIdx,
+                                  const std::vector<ProbSevereObject>& objects) const;
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -309,11 +397,16 @@ private:
     // Auto-refresh timer
     std::chrono::steady_clock::time_point m_lastRefresh;
     std::chrono::steady_clock::time_point m_lastLivePollSweep;
+    std::chrono::steady_clock::time_point m_lastProbSevereRefresh;
     float m_livePollSweepIntervalSec = 1.0f;
     float m_activeStationPollIntervalSec = 6.0f;
+    float m_priorityStationPollIntervalSec = 12.0f;
     float m_visibleStationPollIntervalSec = 30.0f;
-    float m_backgroundStationPollIntervalSec = 120.0f;
+    float m_backgroundStationPollIntervalSec = 180.0f;
+    float m_coldStationPollIntervalSec = 900.0f;
     float m_recoveryStationPollIntervalSec = 20.0f;
+    int   m_bootstrapStationTarget = 15;
+    int   m_maxPriorityPollsPerSweep = 4;
     int   m_maxVisiblePollsPerSweep = 4;
     int   m_maxBackgroundPollsPerSweep = 2;
     PerformanceProfile m_requestedPerformanceProfile = PerformanceProfile::Auto;
@@ -321,6 +414,12 @@ private:
     float m_renderScale = 1.0f;
     MemoryTelemetry m_memoryTelemetry;
     std::chrono::steady_clock::time_point m_lastMemorySample;
+    mutable std::mutex m_priorityMutex;
+    std::unordered_set<int> m_pinnedStations;
+    std::vector<int> m_dynamicPriorityStations;
+    std::vector<ProbSevereObject> m_probSevereObjects;
+    std::atomic<bool> m_probSevereLoading{false};
+    std::string m_priorityStatus;
 
 public:
     // NWS warning overlay
@@ -384,4 +483,25 @@ public:
                m_cachedFrameWidth == w &&
                m_cachedFrameHeight == h;
     }
+
+    // Rolling live loop cache
+    static constexpr int MAX_LIVE_LOOP_FRAMES = 30;
+    bool m_liveLoopEnabled = false;
+    bool m_liveLoopPlaying = false;
+    int m_liveLoopLength = 8;
+    int m_liveLoopCount = 0;
+    int m_liveLoopWriteIndex = 0;
+    int m_liveLoopPlaybackIndex = 0;
+    float m_liveLoopSpeed = 5.0f;
+    float m_liveLoopAccumulator = 0.0f;
+    bool m_liveLoopCapturePending = false;
+    uint32_t* m_liveLoopFrames[MAX_LIVE_LOOP_FRAMES] = {};
+    std::string m_liveLoopLabels[MAX_LIVE_LOOP_FRAMES];
+    int m_liveLoopFrameWidth = 0;
+    int m_liveLoopFrameHeight = 0;
+    std::deque<LiveLoopBackfillFrame> m_liveLoopBackfillQueue;
+    std::mutex m_liveLoopBackfillMutex;
+    std::atomic<bool> m_liveLoopBackfillLoading{false};
+    std::atomic<uint64_t> m_liveLoopBackfillGeneration{0};
+    bool m_liveLoopBackfillReplaceExisting = false;
 };

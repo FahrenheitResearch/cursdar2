@@ -548,6 +548,8 @@ static bool shouldUseInverseFallback(const GpuViewport& vp,
                                      int product) {
     if (product < 0 || product >= NUM_PRODUCTS || info.num_radials <= 0)
         return true;
+    if (product == PROD_VEL)
+        return false;
 
     float gskm = info.gate_spacing_km[product];
     if (gskm <= 0.0f) return true;
