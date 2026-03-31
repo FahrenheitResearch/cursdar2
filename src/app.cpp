@@ -2,6 +2,8 @@
 #include "nexrad/stations.h"
 #include "nexrad/level2_parser.h"
 #include "cuda/gpu_pipeline.cuh"
+#include "cuda/gpu_tensor.cuh"
+#include "cuda/gpu_detection.cuh"
 #include "cuda/preprocess.cuh"
 #include "cuda/volume3d.cuh"
 #include "net/aws_nexrad.h"
@@ -27,6 +29,8 @@ constexpr float kDegToRad = kPi / 180.0f;
 constexpr float kInvalidSample = -9999.0f;
 constexpr const char* kProbSevereHost = "mrms.ncep.noaa.gov";
 constexpr const char* kProbSevereIndexPath = "/ProbSevere/PROBSEVERE/";
+thread_local gpu_tensor::TensorWorkspace g_detectionTensorWorkspace;
+thread_local gpu_detection::CandidateWorkspace g_detectionCandidateWorkspace;
 
 bool extractArchiveTime(const std::string& fname, int& hh, int& mm, int& ss) {
     size_t us = fname.find('_');
@@ -694,9 +698,9 @@ void dealiasPrecomputedSweeps(std::vector<PrecomputedSweep>& sweeps) {
     }
 }
 
-Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
-                                    float slat, float slon,
-                                    const std::string& stationName) {
+Detection computeDetectionForSweepsCpu(const std::vector<PrecomputedSweep>& sweeps,
+                                       float slat, float slon,
+                                       const std::string& stationName) {
     Detection det;
     if (sweeps.empty())
         return det;
@@ -929,6 +933,105 @@ Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
     printf("Detection [%s]: %d TDS, %d hail, %d meso\n",
            stationName.c_str(), (int)det.tds.size(), (int)det.hail.size(), (int)det.meso.size());
     return det;
+}
+
+Detection buildDetectionFromCandidates(const gpu_detection::HostDetectionResults& fields,
+                                       float slat, float slon,
+                                       const std::string& stationName) {
+    Detection det;
+    if (fields.num_radials <= 0 || fields.num_gates <= 0 || fields.azimuths.empty())
+        return det;
+
+    det.computed = true;
+    const float cos_lat = std::max(cosf(slat * kDegToRad), 0.1f);
+
+    for (const auto& candidate : fields.tds) {
+        if (candidate.radial_idx < 0 || candidate.radial_idx >= (int)fields.azimuths.size())
+            continue;
+        const float az_rad = fields.azimuths[candidate.radial_idx] * kDegToRad;
+        const float range_km = fields.first_gate_km + candidate.gate_idx * fields.gate_spacing_km;
+        const float east_km = range_km * sinf(az_rad);
+        const float north_km = range_km * cosf(az_rad);
+        det.tds.push_back({
+            slat + north_km / 111.0f,
+            slon + east_km / (111.0f * cos_lat),
+            candidate.score
+        });
+    }
+
+    for (const auto& candidate : fields.hail) {
+        if (candidate.radial_idx < 0 || candidate.radial_idx >= (int)fields.azimuths.size())
+            continue;
+        const float az_rad = fields.azimuths[candidate.radial_idx] * kDegToRad;
+        const float range_km = fields.first_gate_km + candidate.gate_idx * fields.gate_spacing_km;
+        const float east_km = range_km * sinf(az_rad);
+        const float north_km = range_km * cosf(az_rad);
+        det.hail.push_back({
+            slat + north_km / 111.0f,
+            slon + east_km / (111.0f * cos_lat),
+            candidate.score
+        });
+    }
+
+    for (const auto& candidate : fields.meso) {
+        if (candidate.radial_idx < 0 || candidate.radial_idx >= (int)fields.azimuths.size())
+            continue;
+        const float az_rad = fields.azimuths[candidate.radial_idx] * kDegToRad;
+        const float range_km = fields.first_gate_km + candidate.gate_idx * fields.gate_spacing_km;
+        const float east_km = range_km * sinf(az_rad);
+        const float north_km = range_km * cosf(az_rad);
+        det.meso.push_back({
+            slat + north_km / 111.0f,
+            slon + east_km / (111.0f * cos_lat),
+            candidate.score,
+            candidate.aux
+        });
+    }
+
+    clusterMarkers(det.tds, 8.0f, 12, true);
+    clusterMarkers(det.hail, 10.0f, 16, false);
+    clusterMesoMarkers(det.meso, 12.0f, 12);
+    printf("Detection [%s]: %d TDS, %d hail, %d meso\n",
+           stationName.c_str(), (int)det.tds.size(), (int)det.hail.size(), (int)det.meso.size());
+    return det;
+}
+
+Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
+                                    float slat, float slon,
+                                    const std::string& stationName) {
+    int refSweep = -1, ccSweep = -1, zdrSweep = -1, velSweep = -1;
+    for (int s = 0; s < (int)sweeps.size(); s++) {
+        const auto& pc = sweeps[s];
+        if (pc.elevation_angle > 1.5f) continue;
+        if (pc.products[PROD_REF].has_data && refSweep < 0) refSweep = s;
+        if (pc.products[PROD_CC].has_data && ccSweep < 0) ccSweep = s;
+        if (pc.products[PROD_ZDR].has_data && zdrSweep < 0) zdrSweep = s;
+        if (pc.products[PROD_VEL].has_data && velSweep < 0) velSweep = s;
+    }
+
+    gpu_tensor::SweepInput inputs[gpu_tensor::NUM_TENSOR_PRODUCTS] = {};
+    if (refSweep >= 0) inputs[gpu_tensor::SLOT_REF] = gpu_tensor::makeSweepInput(sweeps[refSweep], PROD_REF);
+    if (velSweep >= 0) inputs[gpu_tensor::SLOT_VEL] = gpu_tensor::makeSweepInput(sweeps[velSweep], PROD_VEL);
+    if (zdrSweep >= 0) inputs[gpu_tensor::SLOT_ZDR] = gpu_tensor::makeSweepInput(sweeps[zdrSweep], PROD_ZDR);
+    if (ccSweep >= 0) inputs[gpu_tensor::SLOT_CC] = gpu_tensor::makeSweepInput(sweeps[ccSweep], PROD_CC);
+
+    gpu_detection::HostDetectionResults fields;
+    bool gpuOk = false;
+
+    try {
+        gpuOk = g_detectionTensorWorkspace.build(inputs);
+        if (gpuOk)
+            gpuOk = gpu_detection::computeDetectionCandidates(g_detectionTensorWorkspace.tensor(),
+                                                              g_detectionCandidateWorkspace,
+                                                              fields,
+                                                              g_detectionTensorWorkspace.stream());
+    } catch (...) {
+        gpuOk = false;
+    }
+
+    if (gpuOk)
+        return buildDetectionFromCandidates(fields, slat, slon, stationName);
+    return computeDetectionForSweepsCpu(sweeps, slat, slon, stationName);
 }
 
 } // namespace

@@ -4,11 +4,66 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
 
 namespace gpu_pipeline {
+
+namespace {
+
+struct PipelineScratch {
+    cudaStream_t owned_stream = nullptr;
+    uint8_t* d_raw = nullptr;
+    size_t raw_capacity = 0;
+    int* d_offsets = nullptr;
+    size_t offset_capacity = 0;
+    int* d_count = nullptr;
+    GpuParsedRadial* d_radials = nullptr;
+    size_t radial_capacity = 0;
+    int* d_indices = nullptr;
+    size_t index_capacity = 0;
+
+    ~PipelineScratch() {
+        if (d_indices) cudaFree(d_indices);
+        if (d_radials) cudaFree(d_radials);
+        if (d_count) cudaFree(d_count);
+        if (d_offsets) cudaFree(d_offsets);
+        if (d_raw) cudaFree(d_raw);
+        if (owned_stream) cudaStreamDestroy(owned_stream);
+    }
+};
+
+thread_local PipelineScratch g_scratch;
+
+cudaStream_t resolveStream(PipelineScratch& scratch, cudaStream_t requested) {
+    if (requested)
+        return requested;
+    if (!scratch.owned_stream)
+        CUDA_CHECK(cudaStreamCreateWithFlags(&scratch.owned_stream, cudaStreamNonBlocking));
+    return scratch.owned_stream;
+}
+
+template <typename T>
+void ensureCapacity(T*& ptr, size_t& capacity, size_t requiredCount) {
+    if (capacity >= requiredCount)
+        return;
+    size_t newCapacity = capacity ? capacity : 1;
+    while (newCapacity < requiredCount)
+        newCapacity = std::max(newCapacity + newCapacity / 2, requiredCount);
+    if (ptr)
+        CUDA_CHECK(cudaFree(ptr));
+    CUDA_CHECK(cudaMalloc(&ptr, newCapacity * sizeof(T)));
+    capacity = newCapacity;
+}
+
+void ensureScalar(int*& ptr) {
+    if (!ptr)
+        CUDA_CHECK(cudaMalloc(&ptr, sizeof(int)));
+}
+
+} // namespace
 
 // ── GPU Parser Kernel ───────────────────────────────────────
 // Each thread scans from a potential message start position.
@@ -266,56 +321,49 @@ __global__ void extractAzimuthsKernel(
 int parseOnGpu(const uint8_t* d_raw_data, size_t raw_size,
                GpuParsedRadial* d_radials_out, int max_radials,
                cudaStream_t stream) {
-    // Allocate offset arrays
-    int* d_offsets;
-    int* d_count;
-    CUDA_CHECK(cudaMallocAsync(&d_offsets, max_radials * sizeof(int), stream));
-    CUDA_CHECK(cudaMallocAsync(&d_count, sizeof(int), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_count, 0, sizeof(int), stream));
+    PipelineScratch& scratch = g_scratch;
+    cudaStream_t activeStream = resolveStream(scratch, stream);
+    ensureCapacity(scratch.d_offsets, scratch.offset_capacity, (size_t)max_radials);
+    ensureScalar(scratch.d_count);
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_count, 0, sizeof(int), activeStream));
 
     // Pass 1: find messages at 2432-byte boundaries
     int num_potential = (int)(raw_size / 2432) + 1;
     int threads = 256;
     int blocks = (num_potential + threads - 1) / threads;
-    findMessageOffsetsKernel<<<blocks, threads, 0, stream>>>(
-        d_raw_data, raw_size, d_offsets, d_count, max_radials);
+    findMessageOffsetsKernel<<<blocks, threads, 0, activeStream>>>(
+        d_raw_data, raw_size, scratch.d_offsets, scratch.d_count, max_radials);
 
     // Get count from pass 1
     int h_count = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count, sizeof(int),
-                                cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpyAsync(&h_count, scratch.d_count, sizeof(int),
+                                cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
 
     if (h_count > 0) {
         const int aligned_count = (h_count > max_radials) ? max_radials : h_count;
         // Pass 2: find variable-offset messages
-        findVariableOffsetsKernel<<<(aligned_count + 255) / 256, 256, 0, stream>>>(
-            d_raw_data, raw_size, d_offsets, aligned_count,
-            d_offsets, d_count, max_radials);
+        findVariableOffsetsKernel<<<(aligned_count + 255) / 256, 256, 0, activeStream>>>(
+            d_raw_data, raw_size, scratch.d_offsets, aligned_count,
+            scratch.d_offsets, scratch.d_count, max_radials);
 
-        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count, sizeof(int),
-                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, scratch.d_count, sizeof(int),
+                                    cudaMemcpyDeviceToHost, activeStream));
+        CUDA_CHECK(cudaStreamSynchronize(activeStream));
     }
 
-    if (h_count <= 0) {
-        cudaFreeAsync(d_offsets, stream);
-        cudaFreeAsync(d_count, stream);
+    if (h_count <= 0)
         return 0;
-    }
 
     h_count = (h_count > max_radials) ? max_radials : h_count;
 
     // Sort offsets
-    thrust::device_ptr<int> d_off_ptr(d_offsets);
-    thrust::sort(thrust::cuda::par.on(stream), d_off_ptr, d_off_ptr + h_count);
+    thrust::device_ptr<int> d_off_ptr(scratch.d_offsets);
+    thrust::sort(thrust::cuda::par.on(activeStream), d_off_ptr, d_off_ptr + h_count);
 
     // Parse all found messages
-    parseMsg31Kernel<<<(h_count + 255) / 256, 256, 0, stream>>>(
-        d_raw_data, raw_size, d_offsets, h_count, d_radials_out);
-
-    cudaFreeAsync(d_offsets, stream);
-    cudaFreeAsync(d_count, stream);
+    parseMsg31Kernel<<<(h_count + 255) / 256, 256, 0, activeStream>>>(
+        d_raw_data, raw_size, scratch.d_offsets, h_count, d_radials_out);
     return h_count;
 }
 
@@ -360,31 +408,26 @@ void transposeGatesGpu(
 GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
                                 cudaStream_t stream) {
     GpuIngestResult result = {};
-
-    // Upload raw data to GPU
-    uint8_t* d_raw;
-    CUDA_CHECK(cudaMallocAsync(&d_raw, raw_size, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_raw, h_raw_data, raw_size,
-                                cudaMemcpyHostToDevice, stream));
+    PipelineScratch& scratch = g_scratch;
+    cudaStream_t activeStream = resolveStream(scratch, stream);
+    ensureCapacity(scratch.d_raw, scratch.raw_capacity, raw_size);
+    CUDA_CHECK(cudaMemcpyAsync(scratch.d_raw, h_raw_data, raw_size,
+                                cudaMemcpyHostToDevice, activeStream));
 
     // Parse on GPU
     constexpr int MAX_PARSED = 8192;
-    GpuParsedRadial* d_radials;
-    CUDA_CHECK(cudaMallocAsync(&d_radials, MAX_PARSED * sizeof(GpuParsedRadial), stream));
+    ensureCapacity(scratch.d_radials, scratch.radial_capacity, MAX_PARSED);
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    int num_parsed = parseOnGpu(d_raw, raw_size, d_radials, MAX_PARSED, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, MAX_PARSED, activeStream);
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
 
-    if (num_parsed <= 0) {
-        cudaFreeAsync(d_raw, stream);
-        cudaFreeAsync(d_radials, stream);
+    if (num_parsed <= 0)
         return result;
-    }
 
     // Read back parsed radials to determine sweep structure and gate params
     std::vector<GpuParsedRadial> h_radials(num_parsed);
-    CUDA_CHECK(cudaMemcpy(h_radials.data(), d_radials,
+    CUDA_CHECK(cudaMemcpy(h_radials.data(), scratch.d_radials,
                            num_parsed * sizeof(GpuParsedRadial),
                            cudaMemcpyDeviceToHost));
 
@@ -404,11 +447,8 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     for (bool seen : seen_sweeps)
         result.total_sweeps += seen ? 1 : 0;
 
-    if (lowest_elev_num < 0) {
-        cudaFreeAsync(d_raw, stream);
-        cudaFreeAsync(d_radials, stream);
+    if (lowest_elev_num < 0)
         return result;
-    }
 
     std::vector<int> lowest_indices;
     lowest_indices.reserve(num_parsed);
@@ -423,11 +463,8 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
 
     result.elevation_angle = lowest_elev;
     result.num_radials = (int)lowest_indices.size();
-    if (result.num_radials <= 0) {
-        cudaFreeAsync(d_raw, stream);
-        cudaFreeAsync(d_radials, stream);
+    if (result.num_radials <= 0)
         return result;
-    }
 
     // Determine gate params from the fullest radial carrying each product.
     for (int radialIdx : lowest_indices) {
@@ -448,29 +485,23 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
 
     // Allocate output buffers
     CUDA_CHECK(cudaMalloc(&result.d_azimuths, result.num_radials * sizeof(float)));
-    int* d_indices = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_indices, result.num_radials * sizeof(int), stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_indices, lowest_indices.data(),
+    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)result.num_radials);
+    CUDA_CHECK(cudaMemcpyAsync(scratch.d_indices, lowest_indices.data(),
                                result.num_radials * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
+                               cudaMemcpyHostToDevice, activeStream));
 
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (result.has_product[p]) {
             size_t sz = (size_t)result.num_gates[p] * result.num_radials * sizeof(uint16_t);
             CUDA_CHECK(cudaMalloc(&result.d_gates[p], sz));
 
-            transposeGatesGpu(d_raw, d_radials, d_indices, result.num_radials, p,
+            transposeGatesGpu(scratch.d_raw, scratch.d_radials, scratch.d_indices, result.num_radials, p,
                               result.d_gates[p], result.num_gates[p],
-                              result.d_azimuths, stream);
+                              result.d_azimuths, activeStream);
         }
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Cleanup temp buffers
-    cudaFreeAsync(d_indices, stream);
-    cudaFreeAsync(d_raw, stream);
-    cudaFreeAsync(d_radials, stream);
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
 
     return result;
 }
