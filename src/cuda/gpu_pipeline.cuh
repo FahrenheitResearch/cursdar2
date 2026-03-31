@@ -1,6 +1,7 @@
 #pragma once
 #include "cuda_common.cuh"
 #include <cuda_runtime.h>
+#include <vector>
 
 // ── GPU-accelerated data pipeline ───────────────────────────
 // Kernels for parsing, transposing, and processing radar data
@@ -60,6 +61,7 @@ struct GpuIngestResult {
     float*    d_azimuths = nullptr;
     uint16_t* d_gates[NUM_PRODUCTS] = {};
     int       num_radials = 0;
+    int       elevation_number = 0;
     int       num_gates[NUM_PRODUCTS] = {};
     float     first_gate_km[NUM_PRODUCTS] = {};
     float     gate_spacing_km[NUM_PRODUCTS] = {};
@@ -72,11 +74,22 @@ struct GpuIngestResult {
     int       total_sweeps = 0;
 };
 
+struct GpuVolumeIngestResult {
+    std::vector<GpuIngestResult> sweeps;
+    int total_sweeps = 0;
+};
+
 // Run full GPU ingest for one sweep's worth of raw data
 GpuIngestResult ingestSweepGpu(
     const uint8_t* h_raw_data, size_t raw_size,
     cudaStream_t stream = 0);
 
+GpuVolumeIngestResult ingestVolumeGpu(
+    const uint8_t* h_raw_data, size_t raw_size,
+    float max_elevation_angle = -1.0f,
+    cudaStream_t stream = 0);
+
 void freeIngestResult(GpuIngestResult& result);
+void freeVolumeIngestResult(GpuVolumeIngestResult& result);
 
 } // namespace gpu_pipeline

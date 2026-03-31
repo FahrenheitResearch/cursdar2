@@ -31,6 +31,13 @@ constexpr const char* kProbSevereHost = "mrms.ncep.noaa.gov";
 constexpr const char* kProbSevereIndexPath = "/ProbSevere/PROBSEVERE/";
 thread_local gpu_tensor::TensorWorkspace g_detectionTensorWorkspace;
 thread_local gpu_detection::CandidateWorkspace g_detectionCandidateWorkspace;
+thread_local gpu_preprocess::PreprocessWorkspace g_preprocessWorkspace;
+
+using Clock = std::chrono::steady_clock;
+
+float elapsedMs(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<float, std::milli>(end - start).count();
+}
 
 bool extractArchiveTime(const std::string& fname, int& hh, int& mm, int& ss) {
     size_t us = fname.find('_');
@@ -498,12 +505,12 @@ void cpuSuppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps)
 }
 
 void dealiasVelocityProduct(PrecomputedSweep::ProductData& velPd, int numRadials) {
-    if (!gpu_preprocess::dealiasVelocity(velPd, numRadials))
+    if (!gpu_preprocess::dealiasVelocity(velPd, numRadials, &g_preprocessWorkspace))
         cpuDealiasVelocityProduct(velPd, numRadials);
 }
 
 void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
-    if (!gpu_preprocess::suppressReflectivityRings(sweeps))
+    if (!gpu_preprocess::suppressReflectivityRings(sweeps, &g_preprocessWorkspace))
         cpuSuppressReflectivityRingArtifacts(sweeps);
 }
 
@@ -640,33 +647,53 @@ std::vector<PrecomputedSweep> buildReducedWorkingSetSweeps(const ParsedRadarData
     return sweeps;
 }
 
-struct FastLowestSweepWorkingSet {
-    std::vector<PrecomputedSweep> sweeps;
-    int total_sweeps = 0;
-    bool success = false;
-};
+std::vector<PrecomputedSweep> buildReducedWorkingSetSweeps(std::vector<PrecomputedSweep> sweeps) {
+    if (sweeps.empty())
+        return sweeps;
 
-FastLowestSweepWorkingSet buildFastLowestSweepWorkingSetGpu(const std::vector<uint8_t>& archiveData) {
-    FastLowestSweepWorkingSet workingSet;
-    if (archiveData.empty())
-        return workingSet;
+    std::vector<int> selected;
+    int lowestIdx = findLowestSweepIndex(sweeps);
+    if (lowestIdx >= 0)
+        selected.push_back(lowestIdx);
 
-    auto decoded = Level2Parser::decodeArchiveBytes(archiveData);
-    if (decoded.empty())
-        return workingSet;
-
-    auto ingest = gpu_pipeline::ingestSweepGpu(decoded.data(), decoded.size());
-    if (!ingest.d_azimuths || ingest.num_radials <= 0) {
-        gpu_pipeline::freeIngestResult(ingest);
-        return workingSet;
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        for (int i = 0; i < (int)sweeps.size(); ++i) {
+            const auto& sweep = sweeps[i];
+            if (sweep.elevation_angle > 1.5f)
+                continue;
+            if (!sweep.products[p].has_data || sweep.num_radials <= 0)
+                continue;
+            if (std::find(selected.begin(), selected.end(), i) == selected.end())
+                selected.push_back(i);
+            break;
+        }
     }
 
+    std::sort(selected.begin(), selected.end(), [&](int a, int b) {
+        const auto& sa = sweeps[a];
+        const auto& sb = sweeps[b];
+        if (fabsf(sa.elevation_angle - sb.elevation_angle) > 0.05f)
+            return sa.elevation_angle < sb.elevation_angle;
+        return a < b;
+    });
+
+    std::vector<PrecomputedSweep> reduced;
+    reduced.reserve(selected.size());
+    for (int idx : selected)
+        reduced.push_back(std::move(sweeps[idx]));
+    return reduced;
+}
+
+PrecomputedSweep buildPrecomputedSweep(const gpu_pipeline::GpuIngestResult& ingest) {
     PrecomputedSweep sweep;
     sweep.elevation_angle = ingest.elevation_angle;
     sweep.num_radials = ingest.num_radials;
+    if (ingest.num_radials <= 0 || !ingest.d_azimuths)
+        return sweep;
+
     sweep.azimuths.resize(ingest.num_radials);
     CUDA_CHECK(cudaMemcpy(sweep.azimuths.data(), ingest.d_azimuths,
-                          ingest.num_radials * sizeof(float), cudaMemcpyDeviceToHost));
+                          (size_t)ingest.num_radials * sizeof(float), cudaMemcpyDeviceToHost));
 
     for (int p = 0; p < NUM_PRODUCTS; ++p) {
         if (!ingest.has_product[p] || !ingest.d_gates[p] || ingest.num_gates[p] <= 0)
@@ -679,15 +706,60 @@ FastLowestSweepWorkingSet buildFastLowestSweepWorkingSetGpu(const std::vector<ui
         pd.gate_spacing_km = ingest.gate_spacing_km[p];
         pd.scale = ingest.scale[p];
         pd.offset = ingest.offset[p];
-        pd.gates.resize((size_t)pd.num_gates * ingest.num_radials);
+        pd.gates.resize((size_t)pd.num_gates * (size_t)ingest.num_radials);
         CUDA_CHECK(cudaMemcpy(pd.gates.data(), ingest.d_gates[p],
                               pd.gates.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
     }
 
-    gpu_pipeline::freeIngestResult(ingest);
-    workingSet.total_sweeps = std::max(ingest.total_sweeps, 1);
-    workingSet.sweeps.push_back(std::move(sweep));
-    workingSet.success = true;
+    return sweep;
+}
+
+enum class GpuWorkingSetMode {
+    LowestSweep,
+    LowTilts,
+    AllSweeps
+};
+
+struct FastGpuWorkingSet {
+    std::vector<PrecomputedSweep> sweeps;
+    int total_sweeps = 0;
+    bool success = false;
+};
+
+FastGpuWorkingSet buildGpuWorkingSetFromDecoded(const std::vector<uint8_t>& decodedBytes,
+                                                GpuWorkingSetMode mode) {
+    FastGpuWorkingSet workingSet;
+    if (decodedBytes.empty())
+        return workingSet;
+
+    if (mode == GpuWorkingSetMode::LowestSweep) {
+        auto ingest = gpu_pipeline::ingestSweepGpu(decodedBytes.data(), decodedBytes.size());
+        if (!ingest.d_azimuths || ingest.num_radials <= 0) {
+            gpu_pipeline::freeIngestResult(ingest);
+            return workingSet;
+        }
+        workingSet.total_sweeps = std::max(ingest.total_sweeps, 1);
+        workingSet.sweeps.push_back(buildPrecomputedSweep(ingest));
+        gpu_pipeline::freeIngestResult(ingest);
+        workingSet.success = !workingSet.sweeps.empty();
+        return workingSet;
+    }
+
+    const float maxElevation = (mode == GpuWorkingSetMode::LowTilts) ? 1.5f : -1.0f;
+    auto volume = gpu_pipeline::ingestVolumeGpu(decodedBytes.data(), decodedBytes.size(), maxElevation);
+    if (volume.sweeps.empty()) {
+        gpu_pipeline::freeVolumeIngestResult(volume);
+        return workingSet;
+    }
+
+    workingSet.total_sweeps = std::max(volume.total_sweeps, (int)volume.sweeps.size());
+    workingSet.sweeps.reserve(volume.sweeps.size());
+    for (const auto& ingest : volume.sweeps)
+        workingSet.sweeps.push_back(buildPrecomputedSweep(ingest));
+    gpu_pipeline::freeVolumeIngestResult(volume);
+    if (mode == GpuWorkingSetMode::LowTilts)
+        workingSet.sweeps = buildReducedWorkingSetSweeps(std::move(workingSet.sweeps));
+    workingSet.success = !workingSet.sweeps.empty();
     return workingSet;
 }
 
@@ -1268,30 +1340,65 @@ bool App::ensureStationFullVolume(int stationIdx) {
         fallbackLon = st.lon;
     }
 
-    auto parsed = Level2Parser::parse(rawCopy);
-    if (parsed.sweeps.empty())
+    PipelineStageTimings timings = {};
+    ParsedRadarData parsed = {};
+    auto decodeStart = Clock::now();
+    std::vector<uint8_t> decoded = Level2Parser::decodeArchiveBytes(rawCopy);
+    timings.decode_ms = elapsedMs(decodeStart, Clock::now());
+    if (decoded.empty())
         return false;
 
-    auto precomp = buildPrecomputedSweeps(parsed);
+    auto gpuBuildStart = Clock::now();
+    auto gpuWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::AllSweeps);
+    timings.sweep_build_ms = elapsedMs(gpuBuildStart, Clock::now());
+
+    std::vector<PrecomputedSweep> precomp;
+    float detectionLat = fallbackLat;
+    float detectionLon = fallbackLon;
+    int totalSweeps = 0;
+
+    if (gpuWorkingSet.success && !gpuWorkingSet.sweeps.empty()) {
+        precomp = std::move(gpuWorkingSet.sweeps);
+        totalSweeps = gpuWorkingSet.total_sweeps;
+        timings.used_gpu_sweep_build = true;
+    } else {
+        auto parseStart = Clock::now();
+        parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
+        timings.parse_ms = elapsedMs(parseStart, Clock::now());
+        if (parsed.sweeps.empty())
+            return false;
+
+        detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
+        detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
+        auto buildStart = Clock::now();
+        precomp = buildPrecomputedSweeps(parsed);
+        timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
+        totalSweeps = (int)parsed.sweeps.size();
+    }
+
+    auto preprocessStart = Clock::now();
     if (dealiasEnabled)
         dealiasPrecomputedSweeps(precomp);
-    const float detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
-    const float detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
+    timings.preprocess_ms = elapsedMs(preprocessStart, Clock::now());
+
+    auto detectStart = Clock::now();
     Detection detection = computeDetectionForSweeps(precomp, detectionLat, detectionLon, stationName);
+    timings.detection_ms = elapsedMs(detectStart, Clock::now());
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
         auto& st = m_stations[stationIdx];
         if (st.raw_volume_data.empty())
             st.raw_volume_data = std::move(rawCopy);
-        st.total_sweeps = (int)parsed.sweeps.size();
-        st.lowest_sweep_elev = parsed.sweeps.empty() ? 0.0f : parsed.sweeps[0].elevation_angle;
-        st.lowest_sweep_radials = parsed.sweeps.empty() ? 0 : (int)parsed.sweeps[0].radials.size();
-        st.data_lat = parsed.station_lat;
-        st.data_lon = parsed.station_lon;
+        st.total_sweeps = totalSweeps > 0 ? totalSweeps : (int)precomp.size();
+        st.lowest_sweep_elev = precomp.empty() ? 0.0f : precomp.front().elevation_angle;
+        st.lowest_sweep_radials = precomp.empty() ? 0 : precomp.front().num_radials;
+        st.data_lat = detectionLat;
+        st.data_lon = detectionLon;
         st.precomputed = std::move(precomp);
         st.full_volume_resident = true;
         st.parsed = true;
         st.detection = std::move(detection);
+        st.timings = timings;
         st.uploaded = false;
         st.uploaded_product = -1;
         st.uploaded_tilt = -1;
@@ -2716,6 +2823,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
                              const std::string& volumeKey) {
     if (!isCurrentDownloadGeneration(generation)) return false;
 
+    PipelineStageTimings timings = {};
     bool keepFull = snapshotMode || m_historicMode;
     if (!keepFull) {
         std::lock_guard<std::mutex> lock(m_stationMutex);
@@ -2723,80 +2831,115 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
     }
 
     const bool preferFastLowestSweep = (snapshotMode && lowestSweepOnly) || (!keepFull && !m_historicMode);
-    if (preferFastLowestSweep) {
-        auto fastWorkingSet = buildFastLowestSweepWorkingSetGpu(data);
-        if (fastWorkingSet.success && !fastWorkingSet.sweeps.empty()) {
-            std::vector<PrecomputedSweep> precomp = std::move(fastWorkingSet.sweeps);
-            if (dealiasEnabled)
-                dealiasPrecomputedSweeps(precomp);
-            if (snapshotMode)
-                suppressReflectivityRingArtifacts(precomp);
+    const std::string stationName = NEXRAD_STATIONS[stationIdx].icao;
+    const float fallbackLat = NEXRAD_STATIONS[stationIdx].lat;
+    const float fallbackLon = NEXRAD_STATIONS[stationIdx].lon;
 
-            const float detectionLat = NEXRAD_STATIONS[stationIdx].lat;
-            const float detectionLon = NEXRAD_STATIONS[stationIdx].lon;
-            Detection detection = computeDetectionForSweeps(precomp, detectionLat, detectionLon,
-                                                            NEXRAD_STATIONS[stationIdx].icao);
+    auto decodeStart = Clock::now();
+    std::vector<uint8_t> decoded = Level2Parser::decodeArchiveBytes(data);
+    timings.decode_ms = elapsedMs(decodeStart, Clock::now());
+    if (decoded.empty())
+        return false;
 
-            {
+    Detection detection = {};
+    bool haveDetection = false;
+    float detectionLat = fallbackLat;
+    float detectionLon = fallbackLon;
+
+    const bool runPreviewDetect = keepFull && !snapshotMode && !m_historicMode;
+    FastGpuWorkingSet previewWorkingSet;
+    if (runPreviewDetect) {
+        auto previewBuildStart = Clock::now();
+        previewWorkingSet = buildGpuWorkingSetFromDecoded(decoded, GpuWorkingSetMode::LowTilts);
+        timings.gpu_detect_build_ms = elapsedMs(previewBuildStart, Clock::now());
+        if (previewWorkingSet.success && !previewWorkingSet.sweeps.empty()) {
+            if (dealiasEnabled) {
+                auto previewPreprocessStart = Clock::now();
+                dealiasPrecomputedSweeps(previewWorkingSet.sweeps);
+                timings.gpu_detect_preprocess_ms = elapsedMs(previewPreprocessStart, Clock::now());
+            }
+
+            auto previewDetectStart = Clock::now();
+            detection = computeDetectionForSweeps(previewWorkingSet.sweeps, detectionLat, detectionLon, stationName);
+            timings.gpu_detect_ms = elapsedMs(previewDetectStart, Clock::now());
+            timings.used_gpu_detect_stage = detection.computed;
+            haveDetection = detection.computed;
+
+            if (haveDetection) {
                 std::lock_guard<std::mutex> lock(m_stationMutex);
                 if (!isCurrentDownloadGeneration(generation)) return false;
                 auto& st = m_stations[stationIdx];
-                if (!snapshotMode && !m_historicMode && !st.enabled) {
-                    if (st.downloading) {
-                        st.downloading = false;
-                        if (m_stationsDownloading.load() > 0)
-                            m_stationsDownloading--;
-                    }
-                    return true;
-                }
-                st.raw_volume_data = std::move(data);
-                st.total_sweeps = fastWorkingSet.total_sweeps;
-                st.lowest_sweep_elev = precomp.front().elevation_angle;
-                st.lowest_sweep_radials = precomp.front().num_radials;
-                st.data_lat = detectionLat;
-                st.data_lon = detectionLon;
-                st.precomputed = std::move(precomp);
-                st.full_volume_resident = false;
-                st.parsed = true;
-                st.failed = false;
-                st.error.clear();
-                st.detection = std::move(detection);
-                if (!snapshotMode && !m_historicMode)
-                    appendLiveHistoryLocked(st, volumeKey, st.precomputed, detectionLat, detectionLon);
-                if (st.downloading) {
-                    st.downloading = false;
-                    m_stationsDownloading--;
-                }
-                st.lastUpdate = std::chrono::steady_clock::now();
-                st.latestVolumeKey = volumeKey;
+                st.detection = detection;
+                st.timings = timings;
             }
-
-            {
-                std::lock_guard<std::mutex> lock(m_uploadMutex);
-                if (isCurrentDownloadGeneration(generation))
-                    m_uploadQueue.push_back(stationIdx);
-            }
-            if (!snapshotMode && !m_historicMode)
-                trimLiveHistoryWorkingSet(m_activeStationIdx);
-            return true;
         }
     }
 
-    auto parsed = Level2Parser::parse(data);
+    std::vector<PrecomputedSweep> precomp;
+    int totalSweeps = 0;
+    bool finalAlreadyPreprocessed = false;
 
-    if (parsed.sweeps.empty()) {
-        return false;
+    const GpuWorkingSetMode finalMode = preferFastLowestSweep
+        ? GpuWorkingSetMode::LowestSweep
+        : (keepFull ? GpuWorkingSetMode::AllSweeps : GpuWorkingSetMode::LowTilts);
+
+    if (runPreviewDetect && finalMode == GpuWorkingSetMode::LowTilts &&
+        previewWorkingSet.success && !previewWorkingSet.sweeps.empty()) {
+        precomp = std::move(previewWorkingSet.sweeps);
+        totalSweeps = previewWorkingSet.total_sweeps;
+        finalAlreadyPreprocessed = dealiasEnabled;
+        timings.sweep_build_ms = timings.gpu_detect_build_ms;
+        timings.used_gpu_sweep_build = true;
     }
 
-    std::vector<PrecomputedSweep> precomp = keepFull
-        ? buildPrecomputedSweeps(parsed)
-        : buildReducedWorkingSetSweeps(parsed);
-    if (dealiasEnabled)
-        dealiasPrecomputedSweeps(precomp);
-    const float detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : NEXRAD_STATIONS[stationIdx].lat;
-    const float detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : NEXRAD_STATIONS[stationIdx].lon;
-    Detection detection = computeDetectionForSweeps(precomp, detectionLat, detectionLon,
-                                                    NEXRAD_STATIONS[stationIdx].icao);
+    if (precomp.empty()) {
+        auto buildStart = Clock::now();
+        auto gpuWorkingSet = buildGpuWorkingSetFromDecoded(decoded, finalMode);
+        timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
+        if (gpuWorkingSet.success && !gpuWorkingSet.sweeps.empty()) {
+            precomp = std::move(gpuWorkingSet.sweeps);
+            totalSweeps = gpuWorkingSet.total_sweeps;
+            timings.used_gpu_sweep_build = true;
+        }
+    }
+
+    ParsedRadarData parsed = {};
+    if (precomp.empty()) {
+        auto parseStart = Clock::now();
+        parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
+        timings.parse_ms = elapsedMs(parseStart, Clock::now());
+        if (parsed.sweeps.empty())
+            return false;
+
+        detectionLat = parsed.station_lat != 0.0f ? parsed.station_lat : fallbackLat;
+        detectionLon = parsed.station_lon != 0.0f ? parsed.station_lon : fallbackLon;
+
+        auto buildStart = Clock::now();
+        precomp = keepFull ? buildPrecomputedSweeps(parsed)
+                           : buildReducedWorkingSetSweeps(parsed);
+        timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
+        totalSweeps = (int)parsed.sweeps.size();
+    }
+
+    if (!finalAlreadyPreprocessed) {
+        auto preprocessStart = Clock::now();
+        if (dealiasEnabled)
+            dealiasPrecomputedSweeps(precomp);
+        if (snapshotMode)
+            suppressReflectivityRingArtifacts(precomp);
+        timings.preprocess_ms = elapsedMs(preprocessStart, Clock::now());
+    } else if (snapshotMode) {
+        auto ringStart = Clock::now();
+        suppressReflectivityRingArtifacts(precomp);
+        timings.preprocess_ms += elapsedMs(ringStart, Clock::now());
+    }
+
+    if (!haveDetection) {
+        auto detectStart = Clock::now();
+        detection = computeDetectionForSweeps(precomp, detectionLat, detectionLon, stationName);
+        timings.detection_ms = elapsedMs(detectStart, Clock::now());
+        haveDetection = detection.computed;
+    }
 
     if (snapshotMode && lowestSweepOnly) {
         int lowestIdx = findLowestSweepIndex(precomp);
@@ -2805,10 +2948,6 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
             reducedPrecomp.push_back(std::move(precomp[lowestIdx]));
             precomp.swap(reducedPrecomp);
         }
-    }
-
-    if (snapshotMode) {
-        suppressReflectivityRingArtifacts(precomp);
     }
 
     {
@@ -2824,17 +2963,18 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
             return true;
         }
         st.raw_volume_data = std::move(data);
-        st.total_sweeps = (int)parsed.sweeps.size();
-        st.lowest_sweep_elev = parsed.sweeps.empty() ? 0.0f : parsed.sweeps[0].elevation_angle;
-        st.lowest_sweep_radials = parsed.sweeps.empty() ? 0 : (int)parsed.sweeps[0].radials.size();
-        st.data_lat = parsed.station_lat;
-        st.data_lon = parsed.station_lon;
+        st.total_sweeps = totalSweeps > 0 ? totalSweeps : (int)precomp.size();
+        st.lowest_sweep_elev = precomp.empty() ? 0.0f : precomp.front().elevation_angle;
+        st.lowest_sweep_radials = precomp.empty() ? 0 : precomp.front().num_radials;
+        st.data_lat = detectionLat;
+        st.data_lon = detectionLon;
         st.precomputed = std::move(precomp);
         st.full_volume_resident = keepFull && !(snapshotMode && lowestSweepOnly);
         st.parsed = true;
         st.failed = false;
         st.error.clear();
         st.detection = std::move(detection);
+        st.timings = timings;
         if (!snapshotMode && !m_historicMode)
             appendLiveHistoryLocked(st, volumeKey, st.precomputed, detectionLat, detectionLon);
         if (st.downloading) {
@@ -2974,6 +3114,7 @@ std::vector<StationUiState> App::stations() const {
         ui.lowest_elev = st.lowest_sweep_elev;
         ui.lowest_radials = st.lowest_sweep_radials;
         ui.detection = st.detection;
+        ui.timings = st.timings;
         snapshot.push_back(std::move(ui));
     }
     return snapshot;
@@ -3280,6 +3421,7 @@ void App::uploadStation(int stationIdx) {
         info.offset[p] = pd.offset;
     }
 
+    auto uploadStart = Clock::now();
     gpu::allocateStation(stationIdx, info);
 
     // Upload precomputed data (fast - just memcpy, no transposition)
@@ -3290,6 +3432,7 @@ void App::uploadStation(int stationIdx) {
     }
 
     gpu::uploadStationData(stationIdx, info, pc.azimuths.data(), gatePtrs);
+    st.timings.upload_ms = elapsedMs(uploadStart, Clock::now());
 
     st.gpuInfo = info;
     st.uploaded_product = m_activeProduct;

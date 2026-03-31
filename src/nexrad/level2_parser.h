@@ -12,6 +12,11 @@ public:
     // Returns empty on failure.
     static std::vector<uint8_t> decodeArchiveBytes(const std::vector<uint8_t>& fileData);
 
+    // Parse an already-decoded Archive II message stream.
+    // Returns empty data on failure.
+    static ParsedRadarData parseDecodedMessages(const std::vector<uint8_t>& decodedBytes,
+                                                const std::string& stationId = {});
+
     // Parse raw file bytes into structured radar data.
     // Returns empty data on failure.
     static ParsedRadarData parse(const std::vector<uint8_t>& fileData);

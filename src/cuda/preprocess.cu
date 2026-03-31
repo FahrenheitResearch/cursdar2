@@ -161,46 +161,116 @@ __global__ void zeroSuppressedGatesKernel(uint16_t* gates,
         gates[idx] = 0;
 }
 
-bool createStream(cudaStream_t* stream) {
-    return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking) == cudaSuccess;
+template <typename T>
+bool ensureCapacity(T** ptr, size_t* capacity, size_t requiredCount) {
+    if (*capacity >= requiredCount)
+        return true;
+
+    size_t newCapacity = (*capacity > 0) ? *capacity : 1;
+    while (newCapacity < requiredCount)
+        newCapacity = std::max(newCapacity + newCapacity / 2, requiredCount);
+
+    if (*ptr && cudaFree(*ptr) != cudaSuccess)
+        return false;
+    *ptr = nullptr;
+    if (cudaMalloc(ptr, newCapacity * sizeof(T)) != cudaSuccess)
+        return false;
+
+    *capacity = newCapacity;
+    return true;
 }
 
 } // namespace
 
-bool dealiasVelocity(PrecomputedSweep::ProductData& velPd, int numRadials) {
+PreprocessWorkspace::PreprocessWorkspace() = default;
+
+PreprocessWorkspace::~PreprocessWorkspace() {
+    reset();
+}
+
+cudaStream_t PreprocessWorkspace::stream() {
+    if (!m_stream)
+        cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking);
+    return m_stream;
+}
+
+bool PreprocessWorkspace::ensureGateCapacity(size_t gateCount) {
+    if (m_gateCapacity >= gateCount && m_d_source && m_d_corrected)
+        return true;
+
+    size_t newCapacity = (m_gateCapacity > 0) ? m_gateCapacity : 1;
+    while (newCapacity < gateCount)
+        newCapacity = std::max(newCapacity + newCapacity / 2, gateCount);
+
+    if (m_d_source && cudaFree(m_d_source) != cudaSuccess)
+        return false;
+    if (m_d_corrected && cudaFree(m_d_corrected) != cudaSuccess)
+        return false;
+
+    m_d_source = nullptr;
+    m_d_corrected = nullptr;
+    if (cudaMalloc(&m_d_source, newCapacity * sizeof(uint16_t)) != cudaSuccess)
+        return false;
+    if (cudaMalloc(&m_d_corrected, newCapacity * sizeof(uint16_t)) != cudaSuccess) {
+        cudaFree(m_d_source);
+        m_d_source = nullptr;
+        return false;
+    }
+
+    m_gateCapacity = newCapacity;
+    return true;
+}
+
+bool PreprocessWorkspace::ensureSuppressCapacity(size_t gateCount) {
+    return ensureCapacity(&m_d_suppress, &m_suppressCapacity, gateCount);
+}
+
+void PreprocessWorkspace::reset() {
+    if (m_d_suppress) cudaFree(m_d_suppress);
+    if (m_d_corrected) cudaFree(m_d_corrected);
+    if (m_d_source) cudaFree(m_d_source);
+    if (m_stream) cudaStreamDestroy(m_stream);
+    m_d_suppress = nullptr;
+    m_d_corrected = nullptr;
+    m_d_source = nullptr;
+    m_stream = nullptr;
+    m_gateCapacity = 0;
+    m_suppressCapacity = 0;
+}
+
+bool dealiasVelocity(PrecomputedSweep::ProductData& velPd, int numRadials,
+                     PreprocessWorkspace* workspace) {
     if (!velPd.has_data || velPd.num_gates <= 0 || numRadials <= 2 || velPd.gates.empty())
         return true;
 
-    cudaStream_t stream = nullptr;
-    if (!createStream(&stream))
+    PreprocessWorkspace ownedWorkspace;
+    PreprocessWorkspace* activeWorkspace = workspace ? workspace : &ownedWorkspace;
+    cudaStream_t stream = activeWorkspace->stream();
+    if (!stream)
         return false;
 
     const size_t bytes = velPd.gates.size() * sizeof(uint16_t);
-    uint16_t* d_source = nullptr;
-    uint16_t* d_corrected = nullptr;
     bool ok = false;
     int total = numRadials * velPd.num_gates;
     int block = 256;
     int grid = (total + block - 1) / block;
 
-    if (cudaMalloc(&d_source, bytes) != cudaSuccess ||
-        cudaMalloc(&d_corrected, bytes) != cudaSuccess) {
-        goto cleanup;
-    }
+    if (!activeWorkspace->ensureGateCapacity(velPd.gates.size()))
+        return false;
 
-    if (cudaMemcpyAsync(d_source, velPd.gates.data(), bytes,
+    if (cudaMemcpyAsync(activeWorkspace->sourceGates(), velPd.gates.data(), bytes,
                         cudaMemcpyHostToDevice, stream) != cudaSuccess) {
         goto cleanup;
     }
 
     dealiasVelocityKernel<<<grid, block, 0, stream>>>(
-        d_source, d_corrected,
+        activeWorkspace->sourceGates(), activeWorkspace->correctedGates(),
         numRadials, velPd.num_gates,
         velPd.scale, velPd.offset);
     if (cudaGetLastError() != cudaSuccess)
         goto cleanup;
 
-    if (cudaMemcpyAsync(velPd.gates.data(), d_corrected, bytes,
+    if (cudaMemcpyAsync(velPd.gates.data(), activeWorkspace->correctedGates(), bytes,
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         goto cleanup;
     }
@@ -210,56 +280,55 @@ bool dealiasVelocity(PrecomputedSweep::ProductData& velPd, int numRadials) {
     ok = true;
 
 cleanup:
-    if (d_corrected) cudaFree(d_corrected);
-    if (d_source) cudaFree(d_source);
-    cudaStreamDestroy(stream);
     return ok;
 }
 
-bool suppressReflectivityRings(std::vector<PrecomputedSweep>& sweeps) {
+bool suppressReflectivityRings(std::vector<PrecomputedSweep>& sweeps,
+                               PreprocessWorkspace* workspace) {
     bool allOk = true;
+    PreprocessWorkspace ownedWorkspace;
+    PreprocessWorkspace* activeWorkspace = workspace ? workspace : &ownedWorkspace;
+    cudaStream_t stream = activeWorkspace->stream();
+    if (!stream)
+        return false;
+
     for (auto& sweep : sweeps) {
         auto& pd = sweep.products[PROD_REF];
         if (!pd.has_data || pd.num_gates <= 0 || sweep.num_radials < 300 || pd.gates.empty())
             continue;
 
-        cudaStream_t stream = nullptr;
-        if (!createStream(&stream)) {
+        const size_t gateBytes = pd.gates.size() * sizeof(uint16_t);
+        const size_t gateCount = pd.gates.size();
+        if (!activeWorkspace->ensureGateCapacity(gateCount) ||
+            !activeWorkspace->ensureSuppressCapacity((size_t)pd.num_gates)) {
             allOk = false;
             continue;
         }
 
-        const size_t gateBytes = pd.gates.size() * sizeof(uint16_t);
-        uint16_t* d_gates = nullptr;
-        uint8_t* d_suppress = nullptr;
         bool ok = false;
         int total = sweep.num_radials * pd.num_gates;
         int block = 256;
         int grid = (total + block - 1) / block;
 
-        if (cudaMalloc(&d_gates, gateBytes) != cudaSuccess ||
-            cudaMalloc(&d_suppress, pd.num_gates * sizeof(uint8_t)) != cudaSuccess) {
-            goto cleanup;
-        }
-
-        if (cudaMemcpyAsync(d_gates, pd.gates.data(), gateBytes,
+        if (cudaMemcpyAsync(activeWorkspace->sourceGates(), pd.gates.data(), gateBytes,
                             cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             goto cleanup;
         }
 
         ringStatsKernel<<<pd.num_gates, 256, 0, stream>>>(
-            d_gates, sweep.num_radials, pd.num_gates,
+            activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
             pd.scale, pd.offset, pd.first_gate_km, pd.gate_spacing_km,
-            d_suppress);
+            activeWorkspace->suppressMask());
         if (cudaGetLastError() != cudaSuccess)
             goto cleanup;
 
         zeroSuppressedGatesKernel<<<grid, block, 0, stream>>>(
-            d_gates, sweep.num_radials, pd.num_gates, d_suppress);
+            activeWorkspace->sourceGates(), sweep.num_radials, pd.num_gates,
+            activeWorkspace->suppressMask());
         if (cudaGetLastError() != cudaSuccess)
             goto cleanup;
 
-        if (cudaMemcpyAsync(pd.gates.data(), d_gates, gateBytes,
+        if (cudaMemcpyAsync(pd.gates.data(), activeWorkspace->sourceGates(), gateBytes,
                             cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
             goto cleanup;
         }
@@ -269,9 +338,6 @@ bool suppressReflectivityRings(std::vector<PrecomputedSweep>& sweeps) {
         ok = true;
 
 cleanup:
-        if (d_suppress) cudaFree(d_suppress);
-        if (d_gates) cudaFree(d_gates);
-        cudaStreamDestroy(stream);
         if (!ok)
             allOk = false;
     }

@@ -342,6 +342,25 @@ __global__ void collectLowestSweepIndicesKernel(const GpuParsedRadial* __restric
     indices_out[slot] = idx;
 }
 
+__global__ void collectSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
+                                          int num_radials,
+                                          int elevation_number,
+                                          int* __restrict__ indices_out,
+                                          int* __restrict__ count_out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_radials)
+        return;
+
+    const GpuParsedRadial& r = radials[idx];
+    if (r.azimuth < 0.0f || r.azimuth >= 360.0f)
+        return;
+    if ((int)r.elevation_number != elevation_number)
+        return;
+
+    int slot = atomicAdd(count_out, 1);
+    indices_out[slot] = idx;
+}
+
 __global__ void selectProductMetaKernel(const GpuParsedRadial* __restrict__ radials,
                                         const int* __restrict__ radial_indices,
                                         int num_radials,
@@ -415,6 +434,102 @@ __global__ void extractAzimuthsKernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_radials) return;
     azimuths_out[i] = radials[radial_indices[i]].azimuth;
+}
+
+std::vector<int> extractSweepNumbers(const std::array<uint32_t, 8>& sweepBits) {
+    std::vector<int> sweepNumbers;
+    for (int word = 0; word < (int)sweepBits.size(); ++word) {
+        uint32_t bits = sweepBits[word];
+        while (bits) {
+            int bitIndex = 0;
+            while (((bits >> bitIndex) & 1u) == 0u)
+                ++bitIndex;
+            sweepNumbers.push_back(word * 32 + bitIndex);
+            bits &= (bits - 1);
+        }
+    }
+    return sweepNumbers;
+}
+
+bool buildSweepResult(const uint8_t* d_raw,
+                      const GpuParsedRadial* d_radials,
+                      PipelineScratch& scratch,
+                      cudaStream_t activeStream,
+                      int num_parsed,
+                      int elevation_number,
+                      GpuIngestResult& result) {
+    result = {};
+
+    const int summaryBlocks = (num_parsed + 255) / 256;
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_selected_count, 0, sizeof(int), activeStream));
+    collectSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+        d_radials, num_parsed, elevation_number, scratch.d_indices, scratch.d_selected_count);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpyAsync(&result.num_radials, scratch.d_selected_count, sizeof(int),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    if (result.num_radials <= 0)
+        return false;
+
+    result.elevation_number = elevation_number;
+    thrust::device_ptr<int> d_idx_ptr(scratch.d_indices);
+    thrust::sort(thrust::cuda::par.on(activeStream), d_idx_ptr, d_idx_ptr + result.num_radials,
+                 RadialIndexByAzimuth{d_radials});
+
+    int firstIndex = -1;
+    GpuParsedRadial firstRadial = {};
+    CUDA_CHECK(cudaMemcpyAsync(&firstIndex, scratch.d_indices, sizeof(int),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    if (firstIndex < 0)
+        return false;
+    CUDA_CHECK(cudaMemcpyAsync(&firstRadial, d_radials + firstIndex, sizeof(GpuParsedRadial),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    result.elevation_angle = firstRadial.elevation;
+
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_product_meta, 0,
+                               NUM_PRODUCTS * sizeof(DeviceProductMeta), activeStream));
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
+            d_radials, scratch.d_indices, result.num_radials, p, scratch.d_product_meta);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    std::array<DeviceProductMeta, NUM_PRODUCTS> hostMeta = {};
+    CUDA_CHECK(cudaMemcpyAsync(hostMeta.data(), scratch.d_product_meta,
+                               hostMeta.size() * sizeof(DeviceProductMeta),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+
+    bool hasAnyProduct = false;
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        const auto& meta = hostMeta[p];
+        if (!meta.has_product || meta.num_gates <= 0)
+            continue;
+        hasAnyProduct = true;
+        result.has_product[p] = true;
+        result.num_gates[p] = meta.num_gates;
+        result.first_gate_km[p] = meta.first_gate / 1000.0f;
+        result.gate_spacing_km[p] = meta.gate_spacing / 1000.0f;
+        result.scale[p] = meta.scale;
+        result.offset[p] = meta.offset;
+    }
+    if (!hasAnyProduct)
+        return false;
+
+    CUDA_CHECK(cudaMalloc(&result.d_azimuths, (size_t)result.num_radials * sizeof(float)));
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        if (!result.has_product[p])
+            continue;
+        const size_t sz = (size_t)result.num_gates[p] * (size_t)result.num_radials * sizeof(uint16_t);
+        CUDA_CHECK(cudaMalloc(&result.d_gates[p], sz));
+        transposeGatesGpu(d_raw, d_radials, scratch.d_indices, result.num_radials, p,
+                          result.d_gates[p], result.num_gates[p], result.d_azimuths, activeStream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    return true;
 }
 
 // ── API Implementation ──────────────────────────────────────
@@ -554,6 +669,7 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
         return result;
 
     const int lowest_elev_num = (int)(lowestKey & 0xFFu);
+    result.elevation_number = lowest_elev_num;
     const int lowest_quant = (int)(lowestKey >> 8);
     result.elevation_angle = (lowest_quant / 1000.0f) - 5.0f;
 
@@ -620,11 +736,86 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     return result;
 }
 
+GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size,
+                                      float max_elevation_angle,
+                                      cudaStream_t stream) {
+    GpuVolumeIngestResult volume = {};
+    PipelineScratch& scratch = g_scratch;
+    cudaStream_t activeStream = resolveStream(scratch, stream);
+    ensureCapacity(scratch.d_raw, scratch.raw_capacity, raw_size);
+    CUDA_CHECK(cudaMemcpyAsync(scratch.d_raw, h_raw_data, raw_size,
+                               cudaMemcpyHostToDevice, activeStream));
+
+    constexpr int MAX_PARSED = 8192;
+    ensureCapacity(scratch.d_radials, scratch.radial_capacity, MAX_PARSED);
+    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)MAX_PARSED);
+    ensureCapacity(scratch.d_lowest_key, scratch.lowest_key_capacity, (size_t)1);
+    ensureCapacity(scratch.d_sweep_bits, scratch.sweep_bits_capacity, (size_t)8);
+    ensureCapacity(scratch.d_selected_count, scratch.selected_count_capacity, (size_t)1);
+    ensureCapacity(scratch.d_product_meta, scratch.product_meta_capacity, (size_t)NUM_PRODUCTS);
+
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, MAX_PARSED, activeStream);
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    if (num_parsed <= 0)
+        return volume;
+
+    const uint32_t invalidLowestKey = 0xFFFFFFFFu;
+    CUDA_CHECK(cudaMemcpyAsync(scratch.d_lowest_key, &invalidLowestKey, sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, activeStream));
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_sweep_bits, 0, 8 * sizeof(uint32_t), activeStream));
+
+    const int summaryBlocks = (num_parsed + 255) / 256;
+    scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+        scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::array<uint32_t, 8> sweepBits = {};
+    CUDA_CHECK(cudaMemcpyAsync(sweepBits.data(), scratch.d_sweep_bits, sweepBits.size() * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+
+    for (uint32_t bits : sweepBits)
+        volume.total_sweeps += countSetBits(bits);
+
+    auto sweepNumbers = extractSweepNumbers(sweepBits);
+    volume.sweeps.reserve(sweepNumbers.size());
+    for (int elevation_number : sweepNumbers) {
+        GpuIngestResult sweep = {};
+        if (!buildSweepResult(scratch.d_raw, scratch.d_radials, scratch, activeStream,
+                              num_parsed, elevation_number, sweep)) {
+            freeIngestResult(sweep);
+            continue;
+        }
+        sweep.total_sweeps = volume.total_sweeps;
+        if (max_elevation_angle >= 0.0f && sweep.elevation_angle > max_elevation_angle + 0.001f) {
+            freeIngestResult(sweep);
+            continue;
+        }
+        volume.sweeps.push_back(std::move(sweep));
+    }
+
+    std::sort(volume.sweeps.begin(), volume.sweeps.end(),
+              [](const GpuIngestResult& a, const GpuIngestResult& b) {
+                  if (fabsf(a.elevation_angle - b.elevation_angle) > 0.001f)
+                      return a.elevation_angle < b.elevation_angle;
+                  return a.elevation_number < b.elevation_number;
+              });
+    return volume;
+}
+
 void freeIngestResult(GpuIngestResult& result) {
     if (result.d_azimuths) { cudaFree(result.d_azimuths); result.d_azimuths = nullptr; }
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (result.d_gates[p]) { cudaFree(result.d_gates[p]); result.d_gates[p] = nullptr; }
     }
+}
+
+void freeVolumeIngestResult(GpuVolumeIngestResult& result) {
+    for (auto& sweep : result.sweeps)
+        freeIngestResult(sweep);
+    result.sweeps.clear();
+    result.total_sweeps = 0;
 }
 
 } // namespace gpu_pipeline

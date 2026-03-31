@@ -531,6 +531,18 @@ std::vector<uint8_t> Level2Parser::decodeArchiveBytes(const std::vector<uint8_t>
     return decodeArchiveBytesImpl(fileData, nullptr, nullptr);
 }
 
+ParsedRadarData Level2Parser::parseDecodedMessages(const std::vector<uint8_t>& decodedBytes,
+                                                   const std::string& stationId) {
+    ParsedRadarData result;
+    result.station_id = stationId;
+    if (decodedBytes.empty())
+        return result;
+
+    parseMessages(decodedBytes.data(), decodedBytes.size(), result);
+    organizeSweeps(result);
+    return result;
+}
+
 ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
                                     ProgressCallback cb) {
     ParsedRadarData result;
@@ -544,12 +556,7 @@ ParsedRadarData Level2Parser::parse(const std::vector<uint8_t>& fileData,
 
     int totalBlocks = 0;
     std::vector<uint8_t> combined = decodeArchiveBytesImpl(fileData, cb, &totalBlocks);
-
-    if (!combined.empty()) {
-        parseMessages(combined.data(), combined.size(), result);
-    }
-
-    organizeSweeps(result);
+    result = parseDecodedMessages(combined, result.station_id);
 
     int totalRadials = 0;
     for (const auto& sweep : result.sweeps)

@@ -40,6 +40,20 @@ struct LiveVolumeHistoryEntry {
     float station_lon = 0.0f;
 };
 
+struct PipelineStageTimings {
+    float decode_ms = 0.0f;
+    float gpu_detect_build_ms = 0.0f;
+    float gpu_detect_preprocess_ms = 0.0f;
+    float gpu_detect_ms = 0.0f;
+    float parse_ms = 0.0f;
+    float sweep_build_ms = 0.0f;
+    float preprocess_ms = 0.0f;
+    float detection_ms = 0.0f;
+    float upload_ms = 0.0f;
+    bool used_gpu_detect_stage = false;
+    bool used_gpu_sweep_build = false;
+};
+
 // Per-station state
 struct StationState {
     int          index;
@@ -65,6 +79,7 @@ struct StationState {
     std::chrono::steady_clock::time_point lastPollAttempt;
     std::string  latestVolumeKey;
     Detection detection;
+    PipelineStageTimings timings;
     std::deque<LiveVolumeHistoryEntry> live_history;
     int uploaded_product = -1;
     int uploaded_tilt = -1;
@@ -91,6 +106,7 @@ struct StationUiState {
     float        lowest_elev = 0.0f;
     int          lowest_radials = 0;
     Detection    detection;
+    PipelineStageTimings timings;
 };
 
 enum class PerformanceProfile {
