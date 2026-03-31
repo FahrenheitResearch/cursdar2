@@ -13,6 +13,15 @@ namespace gpu_pipeline {
 
 namespace {
 
+struct DeviceProductMeta {
+    int has_product = 0;
+    int num_gates = 0;
+    int first_gate = 0;
+    int gate_spacing = 0;
+    float scale = 0.0f;
+    float offset = 0.0f;
+};
+
 struct PipelineScratch {
     cudaStream_t owned_stream = nullptr;
     uint8_t* d_raw = nullptr;
@@ -24,8 +33,20 @@ struct PipelineScratch {
     size_t radial_capacity = 0;
     int* d_indices = nullptr;
     size_t index_capacity = 0;
+    uint32_t* d_lowest_key = nullptr;
+    size_t lowest_key_capacity = 0;
+    uint32_t* d_sweep_bits = nullptr;
+    size_t sweep_bits_capacity = 0;
+    int* d_selected_count = nullptr;
+    size_t selected_count_capacity = 0;
+    DeviceProductMeta* d_product_meta = nullptr;
+    size_t product_meta_capacity = 0;
 
     ~PipelineScratch() {
+        if (d_product_meta) cudaFree(d_product_meta);
+        if (d_selected_count) cudaFree(d_selected_count);
+        if (d_sweep_bits) cudaFree(d_sweep_bits);
+        if (d_lowest_key) cudaFree(d_lowest_key);
         if (d_indices) cudaFree(d_indices);
         if (d_radials) cudaFree(d_radials);
         if (d_count) cudaFree(d_count);
@@ -61,6 +82,15 @@ void ensureCapacity(T*& ptr, size_t& capacity, size_t requiredCount) {
 void ensureScalar(int*& ptr) {
     if (!ptr)
         CUDA_CHECK(cudaMalloc(&ptr, sizeof(int)));
+}
+
+int countSetBits(uint32_t value) {
+    int count = 0;
+    while (value) {
+        value &= (value - 1);
+        ++count;
+    }
+    return count;
 }
 
 } // namespace
@@ -271,6 +301,77 @@ __global__ void findVariableOffsetsKernel(
 // the offset stored in the parsed radial info, writes to
 // gate-major output buffer.
 
+__global__ void scanSweepMetadataKernel(const GpuParsedRadial* __restrict__ radials,
+                                        int num_radials,
+                                        uint32_t* __restrict__ lowest_key,
+                                        uint32_t* __restrict__ sweep_bits) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_radials)
+        return;
+
+    const GpuParsedRadial& r = radials[idx];
+    if (r.azimuth < 0.0f || r.azimuth >= 360.0f)
+        return;
+
+    const unsigned int elev_num = r.elevation_number;
+    if (elev_num < 256u)
+        atomicOr(&sweep_bits[elev_num >> 5], 1u << (elev_num & 31u));
+
+    int quant = __float2int_rn((r.elevation + 5.0f) * 1000.0f);
+    quant = max(0, quant);
+    uint32_t key = ((uint32_t)quant << 8) | (elev_num & 0xFFu);
+    atomicMin(lowest_key, key);
+}
+
+__global__ void collectLowestSweepIndicesKernel(const GpuParsedRadial* __restrict__ radials,
+                                                int num_radials,
+                                                int lowest_elev_num,
+                                                int* __restrict__ indices_out,
+                                                int* __restrict__ count_out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_radials)
+        return;
+
+    const GpuParsedRadial& r = radials[idx];
+    if (r.azimuth < 0.0f || r.azimuth >= 360.0f)
+        return;
+    if ((int)r.elevation_number != lowest_elev_num)
+        return;
+
+    int slot = atomicAdd(count_out, 1);
+    indices_out[slot] = idx;
+}
+
+__global__ void selectProductMetaKernel(const GpuParsedRadial* __restrict__ radials,
+                                        const int* __restrict__ radial_indices,
+                                        int num_radials,
+                                        int product,
+                                        DeviceProductMeta* __restrict__ meta_out) {
+    DeviceProductMeta best = {};
+    for (int i = 0; i < num_radials; ++i) {
+        const GpuParsedRadial& r = radials[radial_indices[i]];
+        if (r.moment_offsets[product] < 0 || r.num_gates[product] <= 0)
+            continue;
+        if (!best.has_product || r.num_gates[product] > best.num_gates) {
+            best.has_product = 1;
+            best.num_gates = r.num_gates[product];
+            best.first_gate = r.first_gate[product];
+            best.gate_spacing = r.gate_spacing[product];
+            best.scale = r.scale[product];
+            best.offset = r.offset[product];
+        }
+    }
+    meta_out[product] = best;
+}
+
+struct RadialIndexByAzimuth {
+    const GpuParsedRadial* radials = nullptr;
+
+    __host__ __device__ bool operator()(int a, int b) const {
+        return radials[a].azimuth < radials[b].azimuth;
+    }
+};
+
 __global__ void transposeKernel(
     const uint8_t* __restrict__ raw_data,
     const GpuParsedRadial* __restrict__ radials,
@@ -417,6 +518,7 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     // Parse on GPU
     constexpr int MAX_PARSED = 8192;
     ensureCapacity(scratch.d_radials, scratch.radial_capacity, MAX_PARSED);
+    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)MAX_PARSED);
 
     CUDA_CHECK(cudaStreamSynchronize(activeStream));
     int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, MAX_PARSED, activeStream);
@@ -425,70 +527,82 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
     if (num_parsed <= 0)
         return result;
 
-    // Read back parsed radials to determine sweep structure and gate params
-    std::vector<GpuParsedRadial> h_radials(num_parsed);
-    CUDA_CHECK(cudaMemcpy(h_radials.data(), scratch.d_radials,
-                           num_parsed * sizeof(GpuParsedRadial),
-                           cudaMemcpyDeviceToHost));
+    ensureCapacity(scratch.d_lowest_key, scratch.lowest_key_capacity, (size_t)1);
+    ensureCapacity(scratch.d_sweep_bits, scratch.sweep_bits_capacity, (size_t)8);
+    ensureCapacity(scratch.d_selected_count, scratch.selected_count_capacity, (size_t)1);
+    ensureCapacity(scratch.d_product_meta, scratch.product_meta_capacity, (size_t)NUM_PRODUCTS);
 
-    // Find the lowest elevation sweep's radials and distinct sweep count.
-    float lowest_elev = 999.0f;
-    int lowest_elev_num = -1;
-    std::array<bool, 256> seen_sweeps = {};
-    for (auto& r : h_radials) {
-        if (r.azimuth < 0) continue;
-        seen_sweeps[r.elevation_number] = true;
-        if (r.elevation < lowest_elev) {
-            lowest_elev = r.elevation;
-            lowest_elev_num = r.elevation_number;
-        }
-    }
+    const uint32_t invalidLowestKey = 0xFFFFFFFFu;
+    CUDA_CHECK(cudaMemcpyAsync(scratch.d_lowest_key, &invalidLowestKey, sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, activeStream));
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_sweep_bits, 0, 8 * sizeof(uint32_t), activeStream));
 
-    for (bool seen : seen_sweeps)
-        result.total_sweeps += seen ? 1 : 0;
+    const int summaryBlocks = (num_parsed + 255) / 256;
+    scanSweepMetadataKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+        scratch.d_radials, num_parsed, scratch.d_lowest_key, scratch.d_sweep_bits);
+    CUDA_CHECK(cudaGetLastError());
 
-    if (lowest_elev_num < 0)
+    uint32_t lowestKey = invalidLowestKey;
+    std::array<uint32_t, 8> sweepBits = {};
+    CUDA_CHECK(cudaMemcpyAsync(&lowestKey, scratch.d_lowest_key, sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaMemcpyAsync(sweepBits.data(), scratch.d_sweep_bits, sweepBits.size() * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+
+    if (lowestKey == invalidLowestKey)
         return result;
 
-    std::vector<int> lowest_indices;
-    lowest_indices.reserve(num_parsed);
-    for (int i = 0; i < num_parsed; ++i) {
-        const auto& r = h_radials[i];
-        if (r.azimuth >= 0.0f && r.azimuth < 360.0f && r.elevation_number == lowest_elev_num)
-            lowest_indices.push_back(i);
-    }
-    std::sort(lowest_indices.begin(), lowest_indices.end(), [&](int a, int b) {
-        return h_radials[a].azimuth < h_radials[b].azimuth;
-    });
+    const int lowest_elev_num = (int)(lowestKey & 0xFFu);
+    const int lowest_quant = (int)(lowestKey >> 8);
+    result.elevation_angle = (lowest_quant / 1000.0f) - 5.0f;
 
-    result.elevation_angle = lowest_elev;
-    result.num_radials = (int)lowest_indices.size();
+    for (uint32_t bits : sweepBits)
+        result.total_sweeps += countSetBits(bits);
+
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_selected_count, 0, sizeof(int), activeStream));
+    collectLowestSweepIndicesKernel<<<summaryBlocks, 256, 0, activeStream>>>(
+        scratch.d_radials, num_parsed, lowest_elev_num, scratch.d_indices, scratch.d_selected_count);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaMemcpyAsync(&result.num_radials, scratch.d_selected_count, sizeof(int),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
     if (result.num_radials <= 0)
         return result;
 
-    // Determine gate params from the fullest radial carrying each product.
-    for (int radialIdx : lowest_indices) {
-        const auto& r = h_radials[radialIdx];
-        for (int p = 0; p < NUM_PRODUCTS; p++) {
-            if (r.moment_offsets[p] >= 0 && r.num_gates[p] > 0) {
-                if (!result.has_product[p] || r.num_gates[p] > result.num_gates[p]) {
-                    result.has_product[p] = true;
-                    result.num_gates[p] = r.num_gates[p];
-                    result.first_gate_km[p] = r.first_gate[p] / 1000.0f;
-                    result.gate_spacing_km[p] = r.gate_spacing[p] / 1000.0f;
-                    result.scale[p] = r.scale[p];
-                    result.offset[p] = r.offset[p];
-                }
-            }
-        }
+    thrust::device_ptr<int> d_idx_ptr(scratch.d_indices);
+    thrust::sort(thrust::cuda::par.on(activeStream), d_idx_ptr, d_idx_ptr + result.num_radials,
+                 RadialIndexByAzimuth{scratch.d_radials});
+
+    CUDA_CHECK(cudaMemsetAsync(scratch.d_product_meta, 0,
+                               NUM_PRODUCTS * sizeof(DeviceProductMeta), activeStream));
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        selectProductMetaKernel<<<1, 1, 0, activeStream>>>(
+            scratch.d_radials, scratch.d_indices, result.num_radials, p, scratch.d_product_meta);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    std::array<DeviceProductMeta, NUM_PRODUCTS> hostMeta = {};
+    CUDA_CHECK(cudaMemcpyAsync(hostMeta.data(), scratch.d_product_meta,
+                               hostMeta.size() * sizeof(DeviceProductMeta),
+                               cudaMemcpyDeviceToHost, activeStream));
+    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        const auto& meta = hostMeta[p];
+        if (!meta.has_product || meta.num_gates <= 0)
+            continue;
+        result.has_product[p] = true;
+        result.num_gates[p] = meta.num_gates;
+        result.first_gate_km[p] = meta.first_gate / 1000.0f;
+        result.gate_spacing_km[p] = meta.gate_spacing / 1000.0f;
+        result.scale[p] = meta.scale;
+        result.offset[p] = meta.offset;
     }
 
     // Allocate output buffers
     CUDA_CHECK(cudaMalloc(&result.d_azimuths, result.num_radials * sizeof(float)));
-    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)result.num_radials);
-    CUDA_CHECK(cudaMemcpyAsync(scratch.d_indices, lowest_indices.data(),
-                               result.num_radials * sizeof(int),
-                               cudaMemcpyHostToDevice, activeStream));
 
     for (int p = 0; p < NUM_PRODUCTS; p++) {
         if (result.has_product[p]) {
