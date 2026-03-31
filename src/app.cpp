@@ -2132,45 +2132,59 @@ void App::requestLiveLoopBackfill() {
                 }
             }
 
+            std::unordered_set<std::string> existingKeys;
+            existingKeys.reserve(orderedFrames.size() + selectedKeys.size());
+            for (const auto& existing : orderedFrames)
+                existingKeys.insert(existing.key);
+
+            std::vector<std::string> keysToFetch;
+            keysToFetch.reserve(selectedKeys.size());
             for (const auto& key : selectedKeys) {
+                if (existingKeys.insert(key).second)
+                    keysToFetch.push_back(key);
+            }
+
+            if (!keysToFetch.empty()) {
+                std::mutex orderedFramesMutex;
+                auto backfillDownloader = std::make_shared<Downloader>(std::min<int>(8, (int)keysToFetch.size()));
+                for (const auto& key : keysToFetch) {
+                    backfillDownloader->queueDownload(
+                        key, NEXRAD_HOST, "/" + key,
+                        [this, &orderedFrames, &orderedFramesMutex, generation,
+                         dealiasEnabled, fallbackLat, fallbackLon](const std::string& id, DownloadResult result) {
+                            if (generation != m_liveLoopBackfillGeneration.load())
+                                return;
+                            if (!result.success || result.data.empty())
+                                return;
+
+                            auto parsed = Level2Parser::parse(result.data);
+                            if (parsed.sweeps.empty())
+                                return;
+
+                            LiveLoopBackfillFrame frame;
+                            frame.label = formatVolumeKeyTimestamp(id);
+                            frame.sweeps = buildPrecomputedSweeps(parsed);
+                            if (dealiasEnabled)
+                                dealiasPrecomputedSweeps(frame.sweeps);
+                            frame.station_lat = (parsed.station_lat != 0.0f) ? parsed.station_lat : fallbackLat;
+                            frame.station_lon = (parsed.station_lon != 0.0f) ? parsed.station_lon : fallbackLon;
+
+                            if (frame.sweeps.empty())
+                                return;
+
+                            OrderedLoopFrame ordered;
+                            ordered.key = id;
+                            ordered.frame = std::move(frame);
+                            std::lock_guard<std::mutex> lock(orderedFramesMutex);
+                            orderedFrames.push_back(std::move(ordered));
+                        });
+                }
+
+                backfillDownloader->waitAll();
                 if (generation != m_liveLoopBackfillGeneration.load()) {
                     m_liveLoopBackfillLoading = false;
                     return;
                 }
-
-                bool alreadyPresent = false;
-                for (const auto& existing : orderedFrames) {
-                    if (existing.key == key) {
-                        alreadyPresent = true;
-                        break;
-                    }
-                }
-                if (alreadyPresent)
-                    continue;
-
-                DownloadResult fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + key);
-                if (!fileResult.success || fileResult.data.empty())
-                    continue;
-
-                auto parsed = Level2Parser::parse(fileResult.data);
-                if (parsed.sweeps.empty())
-                    continue;
-
-                LiveLoopBackfillFrame frame;
-                frame.label = formatVolumeKeyTimestamp(key);
-                frame.sweeps = buildPrecomputedSweeps(parsed);
-                if (dealiasEnabled)
-                    dealiasPrecomputedSweeps(frame.sweeps);
-                frame.station_lat = (parsed.station_lat != 0.0f) ? parsed.station_lat : fallbackLat;
-                frame.station_lon = (parsed.station_lon != 0.0f) ? parsed.station_lon : fallbackLon;
-
-                if (frame.sweeps.empty())
-                    continue;
-
-                OrderedLoopFrame ordered;
-                ordered.key = key;
-                ordered.frame = std::move(frame);
-                orderedFrames.push_back(std::move(ordered));
             }
 
             std::sort(orderedFrames.begin(), orderedFrames.end(),
@@ -2287,91 +2301,97 @@ void App::processLiveLoopBackfill() {
     if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection)
         return;
 
-    LiveLoopBackfillFrame frame;
-    bool haveFrame = false;
-    bool replaceExisting = false;
-    {
-        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
-        if (!m_liveLoopBackfillQueue.empty() && m_liveLoopBackfillReplaceExisting) {
-            replaceExisting = true;
-            m_liveLoopBackfillReplaceExisting = false;
+    constexpr int kMaxFramesPerPass = 8;
+    bool processedAny = false;
+
+    for (int processed = 0; processed < kMaxFramesPerPass; ++processed) {
+        LiveLoopBackfillFrame frame;
+        bool haveFrame = false;
+        bool replaceExisting = false;
+        {
+            std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+            if (!m_liveLoopBackfillQueue.empty() && m_liveLoopBackfillReplaceExisting) {
+                replaceExisting = true;
+                m_liveLoopBackfillReplaceExisting = false;
+            }
+            if (!m_liveLoopBackfillQueue.empty()) {
+                frame = std::move(m_liveLoopBackfillQueue.front());
+                m_liveLoopBackfillQueue.pop_front();
+                haveFrame = true;
+            }
         }
-        if (!m_liveLoopBackfillQueue.empty()) {
-            frame = std::move(m_liveLoopBackfillQueue.front());
-            m_liveLoopBackfillQueue.pop_front();
-            haveFrame = true;
-        }
-    }
 
-    if (!haveFrame) {
-        if (!m_liveLoopBackfillLoading && m_liveLoopCount == 0)
-            requestLiveLoopCapture();
-        return;
-    }
+        if (!haveFrame)
+            break;
 
-    if (replaceExisting)
-        resetLiveLoopFrameCache(false);
+        if (replaceExisting)
+            resetLiveLoopFrameCache(false);
 
-    const int productTilts = countProductSweeps(frame.sweeps, m_activeProduct);
-    if (productTilts <= 0)
-        return;
-
-    const int sweepIdx = findProductSweep(frame.sweeps, m_activeProduct,
-                                          std::min(m_activeTilt, productTilts - 1));
-    if (sweepIdx < 0 || sweepIdx >= (int)frame.sweeps.size())
-        return;
-
-    const auto& pc = frame.sweeps[sweepIdx];
-    if (pc.num_radials <= 0)
-        return;
-
-    constexpr int kLiveLoopBackfillSlot = MAX_STATIONS - 1;
-    GpuStationInfo info = {};
-    info.lat = frame.station_lat;
-    info.lon = frame.station_lon;
-    info.elevation_angle = pc.elevation_angle;
-    info.num_radials = pc.num_radials;
-
-    const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
-    for (int p = 0; p < NUM_PRODUCTS; p++) {
-        const auto& pd = pc.products[p];
-        if (!pd.has_data)
+        const int productTilts = countProductSweeps(frame.sweeps, m_activeProduct);
+        if (productTilts <= 0)
             continue;
-        info.has_product[p] = true;
-        info.num_gates[p] = pd.num_gates;
-        info.first_gate_km[p] = pd.first_gate_km;
-        info.gate_spacing_km[p] = pd.gate_spacing_km;
-        info.scale[p] = pd.scale;
-        info.offset[p] = pd.offset;
-        if (!pd.gates.empty())
-            gatePtrs[p] = pd.gates.data();
+
+        const int sweepIdx = findProductSweep(frame.sweeps, m_activeProduct,
+                                              std::min(m_activeTilt, productTilts - 1));
+        if (sweepIdx < 0 || sweepIdx >= (int)frame.sweeps.size())
+            continue;
+
+        const auto& pc = frame.sweeps[sweepIdx];
+        if (pc.num_radials <= 0)
+            continue;
+
+        constexpr int kLiveLoopBackfillSlot = MAX_STATIONS - 1;
+        GpuStationInfo info = {};
+        info.lat = frame.station_lat;
+        info.lon = frame.station_lon;
+        info.elevation_angle = pc.elevation_angle;
+        info.num_radials = pc.num_radials;
+
+        const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+        for (int p = 0; p < NUM_PRODUCTS; p++) {
+            const auto& pd = pc.products[p];
+            if (!pd.has_data)
+                continue;
+            info.has_product[p] = true;
+            info.num_gates[p] = pd.num_gates;
+            info.first_gate_km[p] = pd.first_gate_km;
+            info.gate_spacing_km[p] = pd.gate_spacing_km;
+            info.scale[p] = pd.scale;
+            info.offset[p] = pd.offset;
+            if (!pd.gates.empty())
+                gatePtrs[p] = pd.gates.data();
+        }
+
+        gpu::allocateStation(kLiveLoopBackfillSlot, info);
+        gpu::uploadStationData(kLiveLoopBackfillSlot, info, pc.azimuths.data(), gatePtrs);
+        gpu::syncStation(kLiveLoopBackfillSlot);
+
+        const int rw = renderWidth();
+        const int rh = renderHeight();
+        GpuViewport gpuVp;
+        gpuVp.center_lat = (float)m_viewport.center_lat;
+        gpuVp.center_lon = (float)m_viewport.center_lon;
+        gpuVp.deg_per_pixel_x =
+            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.width / (float)rw);
+        gpuVp.deg_per_pixel_y =
+            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.height / (float)rh);
+        gpuVp.width = rw;
+        gpuVp.height = rh;
+
+        const float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
+        const float activeThreshold = (m_activeProduct == PROD_VEL)
+            ? m_velocityMinThreshold
+            : m_dbzMinThreshold;
+        gpu::forwardRenderStation(gpuVp, kLiveLoopBackfillSlot,
+                                  m_activeProduct, activeThreshold,
+                                  m_d_compositeOutput, srvSpd, m_stormDir);
+        captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height, frame.label);
+        gpu::freeStation(kLiveLoopBackfillSlot);
+        processedAny = true;
     }
 
-    gpu::allocateStation(kLiveLoopBackfillSlot, info);
-    gpu::uploadStationData(kLiveLoopBackfillSlot, info, pc.azimuths.data(), gatePtrs);
-    gpu::syncStation(kLiveLoopBackfillSlot);
-
-    const int rw = renderWidth();
-    const int rh = renderHeight();
-    GpuViewport gpuVp;
-    gpuVp.center_lat = (float)m_viewport.center_lat;
-    gpuVp.center_lon = (float)m_viewport.center_lon;
-    gpuVp.deg_per_pixel_x =
-        (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.width / (float)rw);
-    gpuVp.deg_per_pixel_y =
-        (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.height / (float)rh);
-    gpuVp.width = rw;
-    gpuVp.height = rh;
-
-    const float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
-    const float activeThreshold = (m_activeProduct == PROD_VEL)
-        ? m_velocityMinThreshold
-        : m_dbzMinThreshold;
-    gpu::forwardRenderStation(gpuVp, kLiveLoopBackfillSlot,
-                              m_activeProduct, activeThreshold,
-                              m_d_compositeOutput, srvSpd, m_stormDir);
-    captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height, frame.label);
-    gpu::freeStation(kLiveLoopBackfillSlot);
+    if (!processedAny && !m_liveLoopBackfillLoading && m_liveLoopCount == 0)
+        requestLiveLoopCapture();
 }
 
 void App::setLiveLoopEnabled(bool enabled) {
@@ -2999,6 +3019,7 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         }
     }
 
+    bool refreshLiveLoop = false;
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
         if (!isCurrentDownloadGeneration(generation)) return false;
@@ -3032,6 +3053,9 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
         }
         st.lastUpdate = std::chrono::steady_clock::now();
         st.latestVolumeKey = volumeKey;
+        refreshLiveLoop = !snapshotMode && !m_historicMode &&
+            m_liveLoopEnabled && !m_showAll && !m_mode3D && !m_crossSection &&
+            stationIdx == m_activeStationIdx;
 
         if (!keepFull)
             trimStationToLowestSweepLocked(st);
@@ -3044,6 +3068,8 @@ bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t
     }
     if (!snapshotMode && !m_historicMode)
         trimLiveHistoryWorkingSet(m_activeStationIdx);
+    if (refreshLiveLoop)
+        requestLiveLoopBackfill();
     return true;
 }
 
@@ -3646,9 +3672,11 @@ void App::update(float dt) {
         for (int idx : m_uploadQueue) {
             uploadStation(idx);
             if (m_liveLoopEnabled && !m_snapshotMode && !m_historicMode &&
-                !m_mode3D && !m_crossSection &&
-                (m_showAll || idx == m_activeStationIdx)) {
-                requestLiveLoopCapture();
+                !m_mode3D && !m_crossSection) {
+                if (!m_showAll && idx == m_activeStationIdx)
+                    requestLiveLoopBackfill();
+                else if (m_showAll)
+                    requestLiveLoopCapture();
             }
         }
         m_uploadQueue.clear();
