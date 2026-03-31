@@ -16,6 +16,7 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
+#include <cstddef>
 
 #include "nexrad/sweep_data.h"
 
@@ -69,6 +70,27 @@ struct StationUiState {
     float        lowest_elev = 0.0f;
     int          lowest_radials = 0;
     Detection    detection;
+};
+
+enum class PerformanceProfile {
+    Auto = 0,
+    Quality,
+    Balanced,
+    Performance
+};
+
+struct MemoryTelemetry {
+    size_t gpu_total_bytes = 0;
+    size_t gpu_free_bytes = 0;
+    size_t gpu_used_bytes = 0;
+    size_t gpu_peak_used_bytes = 0;
+    size_t process_working_set_bytes = 0;
+    size_t process_peak_working_set_bytes = 0;
+    size_t historic_cache_bytes = 0;
+    size_t volume_working_set_bytes = 0;
+    int internal_render_width = 0;
+    int internal_render_height = 0;
+    float render_scale = 1.0f;
 };
 
 class App {
@@ -133,6 +155,12 @@ public:
     void            setAutoTrackStation(bool enabled) { m_autoTrackStation = enabled; }
     float           cursorLat() const { return m_mouseLat; }
     float           cursorLon() const { return m_mouseLon; }
+    const MemoryTelemetry& memoryTelemetry() const { return m_memoryTelemetry; }
+    PerformanceProfile requestedPerformanceProfile() const { return m_requestedPerformanceProfile; }
+    PerformanceProfile effectivePerformanceProfile() const { return m_effectivePerformanceProfile; }
+    void            setPerformanceProfile(PerformanceProfile profile);
+    void            resetMemoryPeaks();
+    const std::string& gpuName() const { return m_gpuName; }
     std::vector<WarningPolygon> currentWarnings() const;
     bool            loadColorTableFromFile(const std::string& path);
     void            resetColorTable(int product = -1);
@@ -192,8 +220,16 @@ private:
                             bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
                             const std::string& volumeKey);
     void updateLivePolling(std::chrono::steady_clock::time_point now);
+    void updateMemoryTelemetry(bool force = false);
+    void ensureRenderTargets();
+    void applyPerformanceProfile(bool force = false);
     bool stationLikelyVisible(int stationIdx) const;
     float livePollIntervalSecForStation(int stationIdx, const StationState& st) const;
+    PerformanceProfile recommendedPerformanceProfile() const;
+    int renderWidth() const;
+    int renderHeight() const;
+    int historicFrameCacheLimit() const;
+    bool historicFrameCachingEnabled() const;
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -208,6 +244,8 @@ private:
     std::string      m_snapshotTimestampIso;
     int              m_windowWidth = 1920;
     int              m_windowHeight = 1080;
+    std::string      m_gpuName;
+    size_t           m_gpuTotalMemoryBytes = 0;
 
     // Station data
     std::vector<StationState> m_stations;
@@ -268,6 +306,11 @@ private:
     float m_recoveryStationPollIntervalSec = 20.0f;
     int   m_maxVisiblePollsPerSweep = 4;
     int   m_maxBackgroundPollsPerSweep = 2;
+    PerformanceProfile m_requestedPerformanceProfile = PerformanceProfile::Auto;
+    PerformanceProfile m_effectivePerformanceProfile = PerformanceProfile::Quality;
+    float m_renderScale = 1.0f;
+    MemoryTelemetry m_memoryTelemetry;
+    std::chrono::steady_clock::time_point m_lastMemorySample;
 
 public:
     // NWS warning overlay
@@ -325,6 +368,7 @@ public:
     void cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h);
     bool hasCachedFrame(int frameIdx, int w, int h) const {
         return frameIdx >= 0 &&
+               frameIdx < historicFrameCacheLimit() &&
                frameIdx < m_cachedFrameCount &&
                m_cachedFrames[frameIdx] &&
                m_cachedFrameWidth == w &&

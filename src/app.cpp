@@ -10,6 +10,10 @@
 #include <cctype>
 #include <cmath>
 #include <limits>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace {
 
@@ -80,6 +84,18 @@ std::string makeIsoUtcTimestamp(int year, int month, int day, int hour, int minu
 
 float stationPollJitter(int stationIdx) {
     return 0.85f + 0.03f * float((stationIdx * 7) % 11);
+}
+
+size_t queryProcessWorkingSetBytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters = {};
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        return (size_t)counters.WorkingSetSize;
+    }
+#endif
+    return 0;
 }
 
 std::string buildLiveListQuery(const std::string& station, int year, int month, int day,
@@ -361,16 +377,14 @@ bool App::init(int windowWidth, int windowHeight) {
     // Initialize CUDA renderer
     gpu::init();
 
-    // Allocate compositor output buffer
-    size_t outSize = (size_t)windowWidth * windowHeight * sizeof(uint32_t);
-    CUDA_CHECK(cudaMalloc(&m_d_compositeOutput, outSize));
-    CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0, outSize));
-
-    // Create GL texture for display
-    if (!m_outputTex.init(windowWidth, windowHeight)) {
-        fprintf(stderr, "Failed to create output texture\n");
-        return false;
-    }
+    int device = 0;
+    cudaDeviceProp prop = {};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    m_gpuName = prop.name;
+    m_gpuTotalMemoryBytes = (size_t)prop.totalGlobalMem;
+    m_lastMemorySample = std::chrono::steady_clock::now();
+    applyPerformanceProfile(true);
 
     // Set up viewport centered on CONUS
     m_viewport.center_lat = 39.0;
@@ -378,6 +392,7 @@ bool App::init(int windowWidth, int windowHeight) {
     m_viewport.zoom = 28.0; // pixels per degree - shows full CONUS
     m_viewport.width = windowWidth;
     m_viewport.height = windowHeight;
+    ensureRenderTargets();
 
     // Initialize station states
     m_stationsTotal = NUM_NEXRAD_STATIONS;
@@ -400,10 +415,179 @@ bool App::init(int windowWidth, int windowHeight) {
     m_warnings.startPolling();
     m_lastRefresh = std::chrono::steady_clock::now();
     m_lastLivePollSweep = m_lastRefresh;
+    updateMemoryTelemetry(true);
+    resetMemoryPeaks();
 
     printf("App initialized: %d stations, viewport %dx%d\n",
            m_stationsTotal, windowWidth, windowHeight);
     return true;
+}
+
+PerformanceProfile App::recommendedPerformanceProfile() const {
+    if (m_gpuTotalMemoryBytes > 0 && m_gpuTotalMemoryBytes <= (size_t(8) << 30))
+        return PerformanceProfile::Performance;
+    if (m_gpuTotalMemoryBytes > 0 && m_gpuTotalMemoryBytes <= (size_t(12) << 30))
+        return PerformanceProfile::Balanced;
+    return PerformanceProfile::Quality;
+}
+
+int App::renderWidth() const {
+    return std::max(1, (int)std::lround((double)m_windowWidth * m_renderScale));
+}
+
+int App::renderHeight() const {
+    return std::max(1, (int)std::lround((double)m_windowHeight * m_renderScale));
+}
+
+int App::historicFrameCacheLimit() const {
+    switch (m_effectivePerformanceProfile) {
+        case PerformanceProfile::Performance: return 0;
+        case PerformanceProfile::Balanced: return 12;
+        case PerformanceProfile::Auto:
+        case PerformanceProfile::Quality:
+        default: return MAX_CACHED_FRAMES;
+    }
+}
+
+bool App::historicFrameCachingEnabled() const {
+    return historicFrameCacheLimit() > 0;
+}
+
+void App::ensureRenderTargets() {
+    const int rw = renderWidth();
+    const int rh = renderHeight();
+    const bool sizeChanged =
+        !m_d_compositeOutput ||
+        m_memoryTelemetry.internal_render_width != rw ||
+        m_memoryTelemetry.internal_render_height != rh;
+
+    if (sizeChanged) {
+        if (m_d_compositeOutput) {
+            cudaFree(m_d_compositeOutput);
+            m_d_compositeOutput = nullptr;
+        }
+        const size_t outSize = (size_t)rw * rh * sizeof(uint32_t);
+        CUDA_CHECK(cudaMalloc(&m_d_compositeOutput, outSize));
+        CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0, outSize));
+    }
+
+    const bool textureReady = m_outputTex.textureId() != 0;
+    const bool textureOk = textureReady ? m_outputTex.resize(rw, rh)
+                                        : m_outputTex.init(rw, rh);
+    if (!textureOk) {
+        fprintf(stderr, "Failed to create output texture (%dx%d)\n", rw, rh);
+    }
+
+    m_memoryTelemetry.internal_render_width = rw;
+    m_memoryTelemetry.internal_render_height = rh;
+    m_memoryTelemetry.render_scale = m_renderScale;
+}
+
+void App::applyPerformanceProfile(bool force) {
+    const PerformanceProfile resolved = (m_requestedPerformanceProfile == PerformanceProfile::Auto)
+        ? recommendedPerformanceProfile()
+        : m_requestedPerformanceProfile;
+    const PerformanceProfile previous = m_effectivePerformanceProfile;
+    const float previousScale = m_renderScale;
+
+    VolumeQualitySettings volumeQuality = {};
+    switch (resolved) {
+        case PerformanceProfile::Balanced:
+            m_renderScale = 0.85f;
+            volumeQuality.smooth_passes = 1;
+            volumeQuality.ray_step_km = 0.75f;
+            volumeQuality.max_steps = 560;
+            break;
+        case PerformanceProfile::Performance:
+            m_renderScale = 0.67f;
+            volumeQuality.smooth_passes = 0;
+            volumeQuality.ray_step_km = 1.05f;
+            volumeQuality.max_steps = 360;
+            break;
+        case PerformanceProfile::Auto:
+        case PerformanceProfile::Quality:
+        default:
+            m_renderScale = 1.0f;
+            volumeQuality.smooth_passes = 2;
+            volumeQuality.ray_step_km = 0.55f;
+            volumeQuality.max_steps = 720;
+            break;
+    }
+
+    m_effectivePerformanceProfile = resolved;
+    gpu::setVolumeQuality(volumeQuality);
+
+    if (!force &&
+        previous == m_effectivePerformanceProfile &&
+        fabsf(previousScale - m_renderScale) < 0.001f) {
+        updateMemoryTelemetry(true);
+        return;
+    }
+
+    ensureRenderTargets();
+    ensureCrossSectionBuffer(renderWidth(), std::max(200, renderHeight() / 3));
+    invalidateFrameCache(true);
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    m_needsComposite = true;
+    m_needsRerender = true;
+
+    if (m_mode3D || m_crossSection)
+        rebuildVolumeForCurrentSelection();
+
+    updateMemoryTelemetry(true);
+}
+
+void App::setPerformanceProfile(PerformanceProfile profile) {
+    if (m_requestedPerformanceProfile == profile)
+        return;
+    m_requestedPerformanceProfile = profile;
+    applyPerformanceProfile();
+}
+
+void App::updateMemoryTelemetry(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && m_lastMemorySample.time_since_epoch().count() != 0) {
+        const float elapsed = std::chrono::duration<float>(now - m_lastMemorySample).count();
+        if (elapsed < 0.25f)
+            return;
+    }
+    m_lastMemorySample = now;
+
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess) {
+        m_memoryTelemetry.gpu_total_bytes = totalBytes;
+        m_memoryTelemetry.gpu_free_bytes = freeBytes;
+        m_memoryTelemetry.gpu_used_bytes = totalBytes >= freeBytes ? (totalBytes - freeBytes) : 0;
+        m_memoryTelemetry.gpu_peak_used_bytes =
+            std::max(m_memoryTelemetry.gpu_peak_used_bytes, m_memoryTelemetry.gpu_used_bytes);
+    }
+
+    m_memoryTelemetry.process_working_set_bytes = queryProcessWorkingSetBytes();
+    m_memoryTelemetry.process_peak_working_set_bytes =
+        std::max(m_memoryTelemetry.process_peak_working_set_bytes,
+                 m_memoryTelemetry.process_working_set_bytes);
+
+    size_t cachedBytes = 0;
+    if (m_cachedFrameWidth > 0 && m_cachedFrameHeight > 0) {
+        const size_t frameBytes = (size_t)m_cachedFrameWidth * m_cachedFrameHeight * sizeof(uint32_t);
+        for (const auto* frame : m_cachedFrames) {
+            if (frame)
+                cachedBytes += frameBytes;
+        }
+    }
+    m_memoryTelemetry.historic_cache_bytes = cachedBytes;
+    m_memoryTelemetry.volume_working_set_bytes = gpu::volumeWorkingSetBytes();
+    m_memoryTelemetry.internal_render_width = renderWidth();
+    m_memoryTelemetry.internal_render_height = renderHeight();
+    m_memoryTelemetry.render_scale = m_renderScale;
+}
+
+void App::resetMemoryPeaks() {
+    updateMemoryTelemetry(true);
+    m_memoryTelemetry.gpu_peak_used_bytes = m_memoryTelemetry.gpu_used_bytes;
+    m_memoryTelemetry.process_peak_working_set_bytes = m_memoryTelemetry.process_working_set_bytes;
 }
 
 bool App::isCurrentDownloadGeneration(uint64_t generation) const {
@@ -1033,6 +1217,7 @@ void App::invalidateFrameCache(bool freeMemory) {
     m_cachedFrameCount = 0;
     m_cachedFrameWidth = 0;
     m_cachedFrameHeight = 0;
+    m_memoryTelemetry.historic_cache_bytes = 0;
 }
 
 void App::ensureCrossSectionBuffer(int width, int height) {
@@ -1388,13 +1573,17 @@ void App::render() {
     }
 
     {
+        const int rw = renderWidth();
+        const int rh = renderHeight();
         GpuViewport gpuVp;
         gpuVp.center_lat = (float)m_viewport.center_lat;
         gpuVp.center_lon = (float)m_viewport.center_lon;
-        gpuVp.deg_per_pixel_x = 1.0f / (float)m_viewport.zoom;
-        gpuVp.deg_per_pixel_y = 1.0f / (float)m_viewport.zoom;
-        gpuVp.width = m_viewport.width;
-        gpuVp.height = m_viewport.height;
+        gpuVp.deg_per_pixel_x =
+            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.width / (float)rw);
+        gpuVp.deg_per_pixel_y =
+            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.height / (float)rh);
+        gpuVp.width = rw;
+        gpuVp.height = rh;
 
         float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
         float srvDir = m_stormDir;
@@ -1448,7 +1637,7 @@ void App::render() {
                                       m_d_compositeOutput, srvSpd, srvDir);
         } else {
             CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0x0F,
-                        (size_t)m_viewport.width * m_viewport.height * sizeof(uint32_t)));
+                        (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
         }
         // Cross-section: render to separate texture for floating panel
         // In historic mode, use slot 0's data; otherwise use active station
@@ -1480,7 +1669,8 @@ void App::render() {
 
         CUDA_CHECK(cudaDeviceSynchronize());
         m_outputTex.updateFromDevice(m_d_compositeOutput,
-                                      m_viewport.width, m_viewport.height);
+                                      gpuVp.width, gpuVp.height);
+        updateMemoryTelemetry();
     }
 }
 
@@ -1602,14 +1792,11 @@ void App::onResize(int w, int h) {
     m_viewport.width = w;
     m_viewport.height = h;
 
-    // Resize compositor output
-    if (m_d_compositeOutput) cudaFree(m_d_compositeOutput);
-    CUDA_CHECK(cudaMalloc(&m_d_compositeOutput, (size_t)w * h * sizeof(uint32_t)));
-
-    ensureCrossSectionBuffer(w, std::max(200, h / 3));
+    ensureRenderTargets();
+    ensureCrossSectionBuffer(renderWidth(), std::max(200, renderHeight() / 3));
     invalidateFrameCache(true);
-    m_outputTex.resize(w, h);
     m_needsComposite = true;
+    updateMemoryTelemetry(true);
 }
 
 void App::setProduct(int p) {
@@ -2321,7 +2508,8 @@ void App::switchTiltCached(int stationIdx, int newTilt) {
 // ── Pre-baked animation frame cache ─────────────────────────
 
 void App::cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h) {
-    if (frameIdx >= MAX_CACHED_FRAMES) return;
+    if (!historicFrameCachingEnabled()) return;
+    if (frameIdx >= historicFrameCacheLimit()) return;
     if (w <= 0 || h <= 0) return;
 
     if ((m_cachedFrameWidth != 0 || m_cachedFrameHeight != 0) &&
@@ -2337,4 +2525,5 @@ void App::cacheAnimFrame(int frameIdx, const uint32_t* d_src, int w, int h) {
     }
     CUDA_CHECK(cudaMemcpy(m_cachedFrames[frameIdx], d_src, sz, cudaMemcpyDeviceToDevice));
     if (frameIdx >= m_cachedFrameCount) m_cachedFrameCount = frameIdx + 1;
+    m_memoryTelemetry.historic_cache_bytes = sz * (size_t)m_cachedFrameCount;
 }

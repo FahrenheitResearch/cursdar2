@@ -71,6 +71,33 @@ void editWarningColor(const char* label, uint32_t& color) {
         color = imVec4ToRgba(value);
 }
 
+const char* performanceProfileLabel(PerformanceProfile profile) {
+    switch (profile) {
+        case PerformanceProfile::Auto: return "Auto";
+        case PerformanceProfile::Quality: return "Quality";
+        case PerformanceProfile::Balanced: return "Balanced";
+        case PerformanceProfile::Performance: return "Performance";
+        default: return "Unknown";
+    }
+}
+
+std::string formatBytes(size_t bytes) {
+    static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = (double)bytes;
+    int unit = 0;
+    while (value >= 1024.0 && unit < 4) {
+        value /= 1024.0;
+        unit++;
+    }
+
+    char buffer[32];
+    if (unit == 0)
+        std::snprintf(buffer, sizeof(buffer), "%llu %s", (unsigned long long)bytes, kUnits[unit]);
+    else
+        std::snprintf(buffer, sizeof(buffer), "%.2f %s", value, kUnits[unit]);
+    return buffer;
+}
+
 void centerOnWarning(App& app, const WarningPolygon& warning) {
     if (warning.lats.empty() || warning.lons.empty()) return;
 
@@ -521,6 +548,32 @@ void render(App& app) {
     ImGui::Separator();
 
     // ── SRV mode ────────────────────────────────────────────
+    if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kProfileItems[] = {"Auto", "Quality", "Balanced", "Performance"};
+        int profileIdx = (int)app.requestedPerformanceProfile();
+        ImGui::SetNextItemWidth(210);
+        if (ImGui::Combo("Profile", &profileIdx, kProfileItems, IM_ARRAYSIZE(kProfileItems)))
+            app.setPerformanceProfile((PerformanceProfile)profileIdx);
+
+        const auto& mem = app.memoryTelemetry();
+        ImGui::TextWrapped("GPU: %s", app.gpuName().empty() ? "Unknown" : app.gpuName().c_str());
+        ImGui::Text("Effective: %s", performanceProfileLabel(app.effectivePerformanceProfile()));
+        ImGui::Text("Internal Render: %dx%d (%.2fx)",
+                    mem.internal_render_width, mem.internal_render_height, mem.render_scale);
+        ImGui::Text("VRAM: %s / %s",
+                    formatBytes(mem.gpu_used_bytes).c_str(),
+                    formatBytes(mem.gpu_total_bytes).c_str());
+        ImGui::Text("VRAM Peak: %s", formatBytes(mem.gpu_peak_used_bytes).c_str());
+        ImGui::Text("Process RAM: %s", formatBytes(mem.process_working_set_bytes).c_str());
+        ImGui::Text("Process Peak: %s", formatBytes(mem.process_peak_working_set_bytes).c_str());
+        ImGui::Text("Archive Cache: %s", formatBytes(mem.historic_cache_bytes).c_str());
+        ImGui::Text("3D Volume Working Set: %s", formatBytes(mem.volume_working_set_bytes).c_str());
+        if (ImGui::Button("Reset Memory Peaks", ImVec2(210, 24)))
+            app.resetMemoryPeaks();
+    }
+
+    ImGui::Separator();
+
     if (app.activeProduct() == PROD_VEL) {
         bool srv = app.srvMode();
         if (ImGui::Checkbox("Storm-Relative (S)", &srv))
@@ -824,6 +877,17 @@ void render(App& app) {
     ImGui::Text("Stations: %d/%d loaded", app.stationsLoaded(), app.stationsTotal());
     ImGui::Text("Downloads: %d", app.stationsDownloading());
     ImGui::Text("Alerts: %d", warningCount);
+    const auto& mem = app.memoryTelemetry();
+    ImGui::Text("Profile: %s", performanceProfileLabel(app.effectivePerformanceProfile()));
+    ImGui::Text("VRAM: %s / %s (peak %s)",
+                formatBytes(mem.gpu_used_bytes).c_str(),
+                formatBytes(mem.gpu_total_bytes).c_str(),
+                formatBytes(mem.gpu_peak_used_bytes).c_str());
+    ImGui::Text("RAM: %s (peak %s)",
+                formatBytes(mem.process_working_set_bytes).c_str(),
+                formatBytes(mem.process_peak_working_set_bytes).c_str());
+    ImGui::Text("Internal Render: %dx%d",
+                mem.internal_render_width, mem.internal_render_height);
 
     int inspectorStation = app.activeStation();
     if (inspectorStation >= 0 && inspectorStation < (int)stations.size()) {

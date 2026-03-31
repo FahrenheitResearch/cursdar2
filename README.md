@@ -26,6 +26,7 @@ It is being built as a standalone successor to `cursdar`: same GPU-first mentali
 - Storm-relative velocity mode
 - GR / RadarScope-style color table import
 - Early GR-style polling link intake
+- Hardware-aware performance profiles with live VRAM / RAM telemetry
 - Docked workstation UI with station browser, inspector, warnings panel, and historic timeline
 
 ## Live Data Model
@@ -59,6 +60,7 @@ Implemented now:
 - Color table import and per-product reset
 - Polling-link fetch and inspection
 - CUDA-backed rendering pipeline
+- Performance profiles with lower internal render resolution, lighter 3D quality, and reduced archive caching
 
 Not finished yet:
 
@@ -122,6 +124,7 @@ chmod +x build.sh
 ## UI Notes
 
 - The inspector shows the latest scan time for the active site.
+- The operator console exposes `Auto`, `Quality`, `Balanced`, and `Performance` profiles, plus current/peak VRAM and process RAM.
 - The warnings panel can show live or historic polygons depending on mode.
 - Color tables can be loaded from the operator console with a file browser.
 - Polling links are currently ingested and inspected, but not yet fully rendered as full GR-style placefile content.

@@ -111,7 +111,7 @@ target_link_libraries(cursdar2 PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(cursdar2 PRIVATE opengl32 winhttp)
+    target_link_libraries(cursdar2 PRIVATE opengl32 winhttp psapi)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(cursdar2 PRIVATE GL CURL::libcurl dl pthread)

@@ -12,6 +12,7 @@ static float2*             d_volume_scratch = nullptr;
 static cudaArray_t         d_volume_array = nullptr;
 static cudaTextureObject_t d_volume_tex = 0;
 static bool                s_volumeReady = false;
+static VolumeQualitySettings s_volumeQuality = {};
 
 extern __constant__ uint32_t c_colorTable[NUM_PRODUCTS][256];
 
@@ -23,7 +24,6 @@ constexpr float kRadarBeamWidthRad = 0.01745329251994329577f;
 constexpr float kHalfRadarBeamWidthRad = kRadarBeamWidthRad * 0.5f;
 constexpr float kBeamMatchTolerance = 1.35f;
 constexpr float kCrossSectionMaxHeightKm = 15.0f;
-constexpr int kVolumeSmoothPasses = 2;
 
 struct SweepDesc {
     float elevation_deg = 0.0f;
@@ -391,6 +391,8 @@ __global__ void rayMarchKernel(
     float fov_scale,
     int width, int height,
     int product, float dbz_min,
+    float base_step,
+    int max_steps,
     uint32_t* __restrict__ output) {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
@@ -470,8 +472,7 @@ __global__ void rayMarchKernel(
 
     tmin = fmaxf(tmin, 0.001f);
 
-    float base_step = 0.55f;
-    int max_steps = (int)fminf((tmax - tmin) / base_step, 720.0f);
+    int capped_steps = (int)fminf((tmax - tmin) / fmaxf(base_step, 0.05f), (float)max_steps);
 
     const float lx = 0.34f;
     const float ly = -0.22f;
@@ -484,7 +485,7 @@ __global__ void rayMarchKernel(
     float t = tmin;
     int step = 0;
 
-    while (t <= tmax && step < max_steps && alpha < 0.995f) {
+    while (t <= tmax && step < capped_steps && alpha < 0.995f) {
         step++;
 
         float sx = cam_x + dx * t;
@@ -726,6 +727,21 @@ void freeVolume() {
     s_volumeReady = false;
 }
 
+void setVolumeQuality(const VolumeQualitySettings& settings) {
+    s_volumeQuality.smooth_passes = settings.smooth_passes < 0 ? 0 : settings.smooth_passes;
+    s_volumeQuality.ray_step_km = settings.ray_step_km < 0.1f ? 0.1f : settings.ray_step_km;
+    s_volumeQuality.max_steps = settings.max_steps < 64 ? 64 : settings.max_steps;
+}
+
+VolumeQualitySettings getVolumeQuality() {
+    return s_volumeQuality;
+}
+
+size_t volumeWorkingSetBytes() {
+    const size_t vol_size = (size_t)VOL_XY * VOL_XY * VOL_Z * sizeof(float2);
+    return vol_size * 3;
+}
+
 void buildVolume(int station_idx, int product,
                  const GpuStationInfo* sweep_infos, int num_sweeps,
                  const float* const* d_azimuths_per_sweep,
@@ -770,7 +786,7 @@ void buildVolume(int station_idx, int product,
     dim3 block(8, 8);
     dim3 grid((VOL_XY + 7) / 8, (VOL_XY + 7) / 8, VOL_Z);
     buildVolumeKernel<<<grid, block>>>(d_volume_raw, product);
-    for (int pass = 0; pass < kVolumeSmoothPasses; ++pass) {
+    for (int pass = 0; pass < s_volumeQuality.smooth_passes; ++pass) {
         smoothVolumeKernel<<<grid, block>>>(
             (pass & 1) ? d_volume_scratch : d_volume_raw,
             (pass & 1) ? d_volume_raw : d_volume_scratch,
@@ -829,7 +845,10 @@ void renderVolume(const Camera3D& cam, int width, int height,
         fx, fy, fz,
         rx, ry, rz,
         ux, uy, uz,
-        0.62f, width, height, product, dbz_min, d_output);
+        0.62f, width, height, product, dbz_min,
+        s_volumeQuality.ray_step_km,
+        s_volumeQuality.max_steps,
+        d_output);
     CUDA_CHECK(cudaGetLastError());
 }
 

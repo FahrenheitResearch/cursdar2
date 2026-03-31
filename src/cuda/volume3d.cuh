@@ -2,6 +2,7 @@
 #include "cuda_common.cuh"
 #include "renderer.cuh"
 #include <cuda_runtime.h>
+#include <cstddef>
 
 // 3D volumetric storm renderer
 // Builds a voxel grid from multi-tilt radar data, then ray-marches through it.
@@ -18,6 +19,12 @@ struct Camera3D {
     float tilt_angle;    // vertical tilt (degrees, 0=horizon, 90=top-down)
     float distance;      // distance from center (km)
     float target_z;      // look-at altitude (km)
+};
+
+struct VolumeQualitySettings {
+    int smooth_passes = 2;
+    float ray_step_km = 0.55f;
+    int max_steps = 720;
 };
 
 namespace gpu {
@@ -44,5 +51,8 @@ void renderCrossSection(
 
 void initVolume();
 void freeVolume();
+void setVolumeQuality(const VolumeQualitySettings& settings);
+VolumeQualitySettings getVolumeQuality();
+size_t volumeWorkingSetBytes();
 
 } // namespace gpu
