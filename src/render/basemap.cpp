@@ -25,7 +25,7 @@ namespace {
 constexpr double kMercatorMaxLat = 85.05112878;
 constexpr int kTileSize = 256;
 constexpr int kTileSubdivisions = 4;
-constexpr size_t kMaxTileCacheEntries = 320;
+constexpr size_t kMaxTileCacheEntries = 512;
 constexpr auto kRetryCooldown = std::chrono::seconds(12);
 
 struct RasterSourceInfo {
@@ -62,7 +62,7 @@ double tileYToLat(double y, int z) {
 int viewportTileZoom(const Viewport& vp) {
     const double worldPixels = std::max(vp.zoom * 360.0, 256.0);
     const double zoom = std::log2(worldPixels / 256.0);
-    return std::clamp((int)std::lround(zoom), 0, 16);
+    return std::clamp((int)std::floor(zoom), 0, 16);
 }
 
 ImVec2 latLonToScreen(const Viewport& vp, ImVec2 origin, double lat, double lon) {
@@ -532,22 +532,24 @@ void BasemapRenderer::requestVisibleTiles(const Viewport& vp) {
     const double minLat = vp.center_lat - vp.halfExtentLat();
     const double maxLat = vp.center_lat + vp.halfExtentLat();
 
-    const int tilesPerAxis = 1 << z;
-    int x0 = (int)std::floor(lonToTileX(minLon, z)) - 1;
-    int x1 = (int)std::floor(lonToTileX(maxLon, z)) + 1;
-    int y0 = (int)std::floor(latToTileY(maxLat, z)) - 1;
-    int y1 = (int)std::floor(latToTileY(minLat, z)) + 1;
-    y0 = std::max(0, y0);
-    y1 = std::min(tilesPerAxis - 1, y1);
+    for (int requestZ = z; requestZ >= std::max(0, z - 1); --requestZ) {
+        const int tilesPerAxis = 1 << requestZ;
+        int x0 = (int)std::floor(lonToTileX(minLon, requestZ)) - 1;
+        int x1 = (int)std::floor(lonToTileX(maxLon, requestZ)) + 1;
+        int y0 = (int)std::floor(latToTileY(maxLat, requestZ)) - 1;
+        int y1 = (int)std::floor(latToTileY(minLat, requestZ)) + 1;
+        y0 = std::max(0, y0);
+        y1 = std::min(tilesPerAxis - 1, y1);
 
-    for (int ty = y0; ty <= y1; ty++) {
-        for (int tx = x0; tx <= x1; tx++) {
-            int wrappedX = tx % tilesPerAxis;
-            if (wrappedX < 0)
-                wrappedX += tilesPerAxis;
-            TileKey key{layer, z, wrappedX, ty};
-            touchVisibleTile(key);
-            queueTileRequest(key);
+        for (int ty = y0; ty <= y1; ty++) {
+            for (int tx = x0; tx <= x1; tx++) {
+                int wrappedX = tx % tilesPerAxis;
+                if (wrappedX < 0)
+                    wrappedX += tilesPerAxis;
+                TileKey key{layer, requestZ, wrappedX, ty};
+                touchVisibleTile(key);
+                queueTileRequest(key);
+            }
         }
     }
 }
