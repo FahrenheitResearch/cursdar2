@@ -1,15 +1,25 @@
 #pragma once
 #include <cstdint>
 
+enum class RadarFeedKind : uint8_t {
+    AwsS3DatePartitioned = 0,
+    IemLevel2RawDirList
+};
+
 struct StationInfo {
     const char* icao;  // 4-letter ICAO code
     float lat;         // latitude
     float lon;         // longitude
     const char* name;  // city/location name
     const char* state; // state abbreviation (or territory/country code)
+    RadarFeedKind feed = RadarFeedKind::AwsS3DatePartitioned;
+    const char* feed_code = nullptr;
+    const char* cluster_group = nullptr;
+    int cluster_slot = 0;
+    bool experimental = false;
 };
 
-// All operational NEXRAD WSR-88D stations
+// Supported radar sites (operational NEXRAD plus selected experimental/testbed feeds)
 inline constexpr StationInfo NEXRAD_STATIONS[] = {
     // CONUS stations (alphabetical by ICAO)
     {"KABR", 45.4558f, -98.4131f, "Aberdeen", "SD"},
@@ -184,6 +194,24 @@ inline constexpr StationInfo NEXRAD_STATIONS[] = {
 
     // Azores (Portugal)
     {"LPLA", 38.7303f,  -27.3222f, "Lajes Field", "PT"},
+
+    // ROC / Norman testbed feeds from IEM Level II raw archive
+    {"KCRI", 35.2380f, -97.4600f, "Norman Testbed KCRI", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "KCRI", "KCRI", 0, true},
+    {"DAN1", 35.2380f, -97.4600f, "Norman Testbed DAN1", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "DAN1", "KCRI", 1, true},
+    {"DOP1", 35.2380f, -97.4600f, "Norman Testbed DOP1", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "DOP1", "KCRI", 2, true},
+    {"FOP1", 35.2380f, -97.4600f, "Norman Testbed FOP1", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "FOP1", "KCRI", 3, true},
+    {"NOP3", 35.2380f, -97.4600f, "Norman Testbed NOP3", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "NOP3", "KCRI", 4, true},
+    {"NOP4", 35.2380f, -97.4600f, "Norman Testbed NOP4", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "NOP4", "KCRI", 5, true},
+    {"ROP3", 35.2380f, -97.4600f, "Norman Testbed ROP3", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "ROP3", "KCRI", 6, true},
+    {"ROP4", 35.2380f, -97.4600f, "Norman Testbed ROP4", "OK",
+     RadarFeedKind::IemLevel2RawDirList, "ROP4", "KCRI", 7, true},
 };
 
 inline constexpr int NUM_NEXRAD_STATIONS = sizeof(NEXRAD_STATIONS) / sizeof(NEXRAD_STATIONS[0]);

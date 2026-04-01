@@ -41,74 +41,33 @@ float elapsedMs(Clock::time_point start, Clock::time_point end) {
 }
 
 bool extractArchiveTime(const std::string& fname, int& hh, int& mm, int& ss) {
-    size_t us = fname.find('_');
-    if (us == std::string::npos || us + 7 > fname.size()) return false;
-    const std::string timeStr = fname.substr(us + 1, 6);
-    if (timeStr.size() != 6) return false;
-    hh = std::stoi(timeStr.substr(0, 2));
-    mm = std::stoi(timeStr.substr(2, 2));
-    ss = std::stoi(timeStr.substr(4, 2));
-    return true;
+    int year = 0, month = 0, day = 0;
+    return extractRadarFileDateTime(fname, year, month, day, hh, mm, ss);
 }
 
 std::string filenameFromKey(const std::string& key) {
-    size_t slash = key.rfind('/');
-    return (slash != std::string::npos) ? key.substr(slash + 1) : key;
-}
-
-bool isDigitSpan(const std::string& text, size_t pos, size_t count) {
-    if (pos + count > text.size()) return false;
-    for (size_t i = 0; i < count; i++) {
-        const unsigned char ch = (unsigned char)text[pos + i];
-        if (ch < '0' || ch > '9')
-            return false;
-    }
-    return true;
+    return radarFilenameFromKey(key);
 }
 
 std::string formatVolumeKeyTimestamp(const std::string& key) {
     const std::string filename = filenameFromKey(key);
     if (filename.empty()) return {};
 
-    for (size_t i = 0; i < filename.size(); i++) {
-        if (!isDigitSpan(filename, i, 8))
-            continue;
-
-        size_t timePos = std::string::npos;
-        if (i + 15 <= filename.size() && filename[i + 8] == '_' && isDigitSpan(filename, i + 9, 6))
-            timePos = i + 9;
-        else if (i + 14 <= filename.size() && isDigitSpan(filename, i + 8, 6))
-            timePos = i + 8;
-
-        if (timePos == std::string::npos)
-            continue;
-
-        return filename.substr(i, 4) + "-" +
-               filename.substr(i + 4, 2) + "-" +
-               filename.substr(i + 6, 2) + " " +
-               filename.substr(timePos, 2) + ":" +
-               filename.substr(timePos + 2, 2) + ":" +
-               filename.substr(timePos + 4, 2) + " UTC";
+    int year = 0, month = 0, day = 0;
+    int hh = 0, mm = 0, ss = 0;
+    if (extractRadarFileDateTime(filename, year, month, day, hh, mm, ss)) {
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+                      year, month, day, hh, mm, ss);
+        return buffer;
     }
 
     return filename;
 }
 
 bool extractVolumeKeyDate(const std::string& key, int& year, int& month, int& day) {
-    const std::string filename = filenameFromKey(key);
-    if (filename.empty()) return false;
-
-    for (size_t i = 0; i < filename.size(); i++) {
-        if (!isDigitSpan(filename, i, 8))
-            continue;
-
-        year = std::stoi(filename.substr(i, 4));
-        month = std::stoi(filename.substr(i + 4, 2));
-        day = std::stoi(filename.substr(i + 6, 2));
-        return true;
-    }
-
-    return false;
+    int hh = 0, mm = 0, ss = 0;
+    return extractRadarFileDateTime(key, year, month, day, hh, mm, ss);
 }
 
 std::string makeIsoUtcTimestamp(int year, int month, int day, int hour, int minute, int second = 0) {
@@ -134,15 +93,9 @@ size_t queryProcessWorkingSetBytes() {
     return 0;
 }
 
-std::string buildLiveListQuery(const std::string& station, int year, int month, int day,
+std::string buildLiveListQuery(const StationInfo& station, int year, int month, int day,
                                const std::string& currentKey) {
-    std::string listPath = buildListUrl(station, year, month, day);
-    std::string query = "/?list-type=2&prefix=" + std::string(listPath.data() + 1);
-    if (!currentKey.empty())
-        query += "&start-after=" + currentKey;
-    else
-        query += "&max-keys=1000";
-    return query;
+    return buildRadarListRequest(station, year, month, day, currentKey);
 }
 
 std::string trimCopy(std::string text) {
@@ -167,6 +120,28 @@ int findStationIndexByCode(const std::string& station) {
             return i;
     }
     return -1;
+}
+
+std::pair<float, float> stationMarkerPixelOffset(int stationIdx) {
+    if (stationIdx < 0 || stationIdx >= NUM_NEXRAD_STATIONS)
+        return {0.0f, 0.0f};
+
+    const auto& site = NEXRAD_STATIONS[stationIdx];
+    if (!site.cluster_group || site.cluster_group[0] == '\0')
+        return {0.0f, 0.0f};
+
+    static const std::pair<float, float> kOffsets[] = {
+        {0.0f, -20.0f},
+        {14.0f, -14.0f},
+        {20.0f, 0.0f},
+        {14.0f, 14.0f},
+        {0.0f, 20.0f},
+        {-14.0f, 14.0f},
+        {-20.0f, 0.0f},
+        {-14.0f, -14.0f},
+    };
+    return kOffsets[((site.cluster_slot % (int)std::size(kOffsets)) + (int)std::size(kOffsets)) %
+                    (int)std::size(kOffsets)];
 }
 
 std::string makeArchiveRangeLabel(const std::string& station,
@@ -2033,30 +2008,31 @@ void App::requestLiveLoopBackfill() {
     if (!extractVolumeKeyDate(currentKey, year, month, day))
         getUtcDate(year, month, day);
 
-    const std::string listQuery = buildLiveListQuery(stationCode, year, month, day, {});
+    const StationInfo& stationInfo = NEXRAD_STATIONS[requestStationIdx];
+    const std::string listQuery = buildLiveListQuery(stationInfo, year, month, day, {});
     m_downloader->queueDownload(
         stationCode + "_live_loop_backfill",
-        NEXRAD_HOST,
+        radarDataHost(stationInfo),
         listQuery,
         [this, generation, stationCode, currentKey, desiredFrames, dealiasEnabled,
          fallbackLat, fallbackLon, year, month, day, requestStationIdx](const std::string& id, DownloadResult listResult) {
             (void)id;
             if (generation != m_liveLoopBackfillGeneration.load())
                 return;
+            const StationInfo& site = NEXRAD_STATIONS[requestStationIdx];
+            const char* siteHost = radarDataHost(site);
 
             auto fetchList = [&](int y, int m, int d, std::vector<NexradFile>& outFiles) -> bool {
-                DownloadResult result = Downloader::httpGet(NEXRAD_HOST, buildLiveListQuery(stationCode, y, m, d, {}));
+                DownloadResult result = Downloader::httpGet(siteHost, buildLiveListQuery(site, y, m, d, {}));
                 if (!result.success || result.data.empty())
                     return false;
-                std::string xml(result.data.begin(), result.data.end());
-                outFiles = parseS3ListResponse(xml);
+                outFiles = parseRadarListResponse(site, result.data);
                 return !outFiles.empty();
             };
 
             std::vector<NexradFile> files;
             if (listResult.success && !listResult.data.empty()) {
-                std::string xml(listResult.data.begin(), listResult.data.end());
-                files = parseS3ListResponse(xml);
+                files = parseRadarListResponse(site, listResult.data);
             }
             if (files.empty() && !fetchList(year, month, day, files)) {
                 m_liveLoopBackfillLoading = false;
@@ -2090,15 +2066,17 @@ void App::requestLiveLoopBackfill() {
                 int prevYear = year;
                 int prevMonth = month;
                 int prevDay = day;
-                shiftDate(prevYear, prevMonth, prevDay, -1);
-                std::vector<NexradFile> previousFiles;
-                if (fetchList(prevYear, prevMonth, prevDay, previousFiles) && !previousFiles.empty()) {
-                    const int take = std::min(need, (int)previousFiles.size());
-                    std::vector<std::string> priorKeys;
-                    priorKeys.reserve(take);
-                    for (int i = (int)previousFiles.size() - take; i < (int)previousFiles.size(); i++)
-                        priorKeys.push_back(previousFiles[i].key);
-                    selectedKeys.insert(selectedKeys.begin(), priorKeys.begin(), priorKeys.end());
+                if (radarFeedUsesDatePartitionedListing(site)) {
+                    shiftDate(prevYear, prevMonth, prevDay, -1);
+                    std::vector<NexradFile> previousFiles;
+                    if (fetchList(prevYear, prevMonth, prevDay, previousFiles) && !previousFiles.empty()) {
+                        const int take = std::min(need, (int)previousFiles.size());
+                        std::vector<std::string> priorKeys;
+                        priorKeys.reserve(take);
+                        for (int i = (int)previousFiles.size() - take; i < (int)previousFiles.size(); i++)
+                            priorKeys.push_back(previousFiles[i].key);
+                        selectedKeys.insert(selectedKeys.begin(), priorKeys.begin(), priorKeys.end());
+                    }
                 }
             }
 
@@ -2149,7 +2127,7 @@ void App::requestLiveLoopBackfill() {
                 auto backfillDownloader = std::make_shared<Downloader>(std::min<int>(8, (int)keysToFetch.size()));
                 for (const auto& key : keysToFetch) {
                     backfillDownloader->queueDownload(
-                        key, NEXRAD_HOST, "/" + key,
+                        key, siteHost, buildRadarDownloadRequest(site, key),
                         [this, &orderedFrames, &orderedFramesMutex, generation,
                          dealiasEnabled, fallbackLat, fallbackLon](const std::string& id, DownloadResult result) {
                             if (generation != m_liveLoopBackfillGeneration.load())
@@ -2624,6 +2602,7 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
     if (stationIdx < 0 || stationIdx >= m_stationsTotal || m_snapshotMode || m_historicMode)
         return;
 
+    const StationInfo& stationInfo = NEXRAD_STATIONS[stationIdx];
     const uint64_t generation = m_downloadGeneration.load();
     const bool dealiasEnabled = m_dealias;
     const auto now = std::chrono::steady_clock::now();
@@ -2656,16 +2635,19 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
 
     int year, month, day;
     getUtcDate(year, month, day);
-    const std::string listQuery = buildLiveListQuery(station, year, month, day, currentKey);
+    const std::string listQuery = buildLiveListQuery(stationInfo, year, month, day, currentKey);
+    const char* host = radarDataHost(stationInfo);
 
     m_downloader->queueDownload(
         station + "_live_list",
-        NEXRAD_HOST,
+        host,
         listQuery,
         [this, stationIdx, station, generation, dealiasEnabled, currentKey](const std::string& id, DownloadResult listResult) {
             if (!isCurrentDownloadGeneration(generation)) return;
+            const StationInfo& site = NEXRAD_STATIONS[stationIdx];
+            const char* siteHost = radarDataHost(site);
             if (!listResult.success || listResult.data.empty()) {
-                if (!currentKey.empty()) {
+                if (!currentKey.empty() || !radarFeedUsesDatePartitionedListing(site)) {
                     finishLivePollNoChange(stationIdx, generation);
                     return;
                 }
@@ -2674,9 +2656,9 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
                 getUtcDate(y, m, d);
                 shiftDate(y, m, d, -1);
 
-                std::string path2 = buildLiveListQuery(station, y, m, d, {});
+                std::string path2 = buildLiveListQuery(site, y, m, d, {});
 
-                auto retry = Downloader::httpGet(NEXRAD_HOST, path2);
+                auto retry = Downloader::httpGet(siteHost, path2);
                 if (!retry.success || retry.data.empty()) {
                     failDownload(stationIdx, generation, "No data available");
                     return;
@@ -2686,8 +2668,7 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
 
             if (!isCurrentDownloadGeneration(generation)) return;
 
-            std::string xml(listResult.data.begin(), listResult.data.end());
-            auto files = parseS3ListResponse(xml);
+            auto files = parseRadarListResponse(site, listResult.data);
             if (files.empty()) {
                 if (!currentKey.empty()) {
                     finishLivePollNoChange(stationIdx, generation);
@@ -2718,7 +2699,7 @@ void App::queueLiveStationRefresh(int stationIdx, bool force) {
             std::string lastError = "Latest scan unavailable";
             for (const auto& fileKey : candidates) {
                 if (!isCurrentDownloadGeneration(generation)) return;
-                auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + fileKey);
+                auto fileResult = Downloader::httpGet(siteHost, buildRadarDownloadRequest(site, fileKey));
                 if (!fileResult.success || fileResult.data.empty()) {
                     if (!fileResult.error.empty())
                         lastError = fileResult.error;
@@ -2839,33 +2820,66 @@ void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int
 
         std::string station = m_stations[i].icao;
         int idx = i;
-        std::string listPath = buildListUrl(station, year, month, day);
+        const StationInfo& stationInfo = NEXRAD_STATIONS[i];
+        std::string listPath = buildRadarListRequest(stationInfo, year, month, day, {});
+        const char* host = radarDataHost(stationInfo);
 
         m_downloader->queueDownload(
             station + "_archive_list",
-            NEXRAD_HOST,
-            "/?list-type=2&prefix=" + std::string(listPath.data() + 1) + "&max-keys=1000",
-            [this, idx, station, targetSeconds, generation, snapshotMode, lowestSweepOnly, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+            host,
+            listPath,
+            [this, idx, station, year, month, day, targetSeconds, generation, snapshotMode, lowestSweepOnly, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+                (void)id;
                 if (!isCurrentDownloadGeneration(generation)) return;
                 if (!listResult.success || listResult.data.empty()) {
                     failDownload(idx, generation, "Archive listing failed");
                     return;
                 }
 
-                std::string xml(listResult.data.begin(), listResult.data.end());
-                auto files = parseS3ListResponse(xml);
+                const StationInfo& site = NEXRAD_STATIONS[idx];
+                const char* siteHost = radarDataHost(site);
+                auto files = parseRadarListResponse(site, listResult.data);
+                if (radarFeedUsesDatePartitionedListing(site) && files.empty()) {
+                    int prevYear = year;
+                    int prevMonth = month;
+                    int prevDay = day;
+                    shiftDate(prevYear, prevMonth, prevDay, -1);
+                    auto retry = Downloader::httpGet(siteHost, buildRadarListRequest(site, prevYear, prevMonth, prevDay, {}));
+                    if (retry.success && !retry.data.empty())
+                        files = parseRadarListResponse(site, retry.data);
+                }
                 if (files.empty()) {
                     failDownload(idx, generation, "No archive files found");
                     return;
                 }
 
+                auto makeUtcEpoch = [](int y, int mo, int d, int hh, int mi, int ss) -> int64_t {
+                    std::tm tm = {};
+                    tm.tm_year = y - 1900;
+                    tm.tm_mon = mo - 1;
+                    tm.tm_mday = d;
+                    tm.tm_hour = hh;
+                    tm.tm_min = mi;
+                    tm.tm_sec = ss;
+#ifdef _WIN32
+                    return static_cast<int64_t>(_mkgmtime(&tm));
+#else
+                    return static_cast<int64_t>(timegm(&tm));
+#endif
+                };
+
+                const int64_t targetEpoch = makeUtcEpoch(year, month, day,
+                                                         targetSeconds / 3600,
+                                                         (targetSeconds / 60) % 60,
+                                                         targetSeconds % 60);
                 int bestIdx = -1;
-                int bestDelta = std::numeric_limits<int>::max();
+                int64_t bestDelta = std::numeric_limits<int64_t>::max();
                 for (int fi = 0; fi < (int)files.size(); fi++) {
+                    int fy = 0, fm = 0, fd = 0;
                     int hh = 0, mm = 0, ss = 0;
-                    if (!extractArchiveTime(filenameFromKey(files[fi].key), hh, mm, ss))
+                    if (!extractRadarFileDateTime(files[fi].key, fy, fm, fd, hh, mm, ss))
                         continue;
-                    int delta = abs((hh * 3600 + mm * 60 + ss) - targetSeconds);
+                    const int64_t delta = std::llabs(makeUtcEpoch(fy, fm, fd, hh, mm, ss) - targetEpoch);
                     if (delta < bestDelta) {
                         bestDelta = delta;
                         bestIdx = fi;
@@ -2878,7 +2892,7 @@ void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int
                 }
 
                 if (!isCurrentDownloadGeneration(generation)) return;
-                auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + files[bestIdx].key);
+                auto fileResult = Downloader::httpGet(siteHost, buildRadarDownloadRequest(site, files[bestIdx].key));
                 if (fileResult.success && !fileResult.data.empty()) {
                     processDownload(idx, std::move(fileResult.data), generation,
                                     snapshotMode, lowestSweepOnly, dealiasEnabled,
@@ -3172,8 +3186,11 @@ std::vector<StationUiState> App::stations() const {
         ui.icao = st.icao;
         ui.lat = st.lat;
         ui.lon = st.lon;
-        ui.display_lat = st.gpuInfo.lat != 0.0f ? st.gpuInfo.lat : st.lat;
-        ui.display_lon = st.gpuInfo.lon != 0.0f ? st.gpuInfo.lon : st.lon;
+        const float baseLat = st.gpuInfo.lat != 0.0f ? st.gpuInfo.lat : st.lat;
+        const float baseLon = st.gpuInfo.lon != 0.0f ? st.gpuInfo.lon : st.lon;
+        const auto markerOffset = stationMarkerPixelOffset(st.index);
+        ui.display_lat = baseLat - markerOffset.second / std::max(1.0, m_viewport.zoom);
+        ui.display_lon = baseLon + markerOffset.first / std::max(1.0, m_viewport.zoom);
         ui.latest_scan_utc = formatVolumeKeyTimestamp(st.latestVolumeKey);
         ui.enabled = st.enabled;
         ui.pinned = pinnedCopy.find(st.index) != pinnedCopy.end();
@@ -3931,8 +3948,11 @@ int App::stationAtScreen(double mx, double my, float radiusPx) const {
     for (int i = 0; i < (int)m_stations.size(); i++) {
         const float slat = m_stations[i].gpuInfo.lat != 0.0f ? m_stations[i].gpuInfo.lat : m_stations[i].lat;
         const float slon = m_stations[i].gpuInfo.lon != 0.0f ? m_stations[i].gpuInfo.lon : m_stations[i].lon;
-        const float sx = (float)((slon - m_viewport.center_lon) * m_viewport.zoom + m_viewport.width * 0.5);
-        const float sy = (float)((m_viewport.center_lat - slat) * m_viewport.zoom + m_viewport.height * 0.5);
+        const auto markerOffset = stationMarkerPixelOffset(i);
+        const float sx = (float)((slon - m_viewport.center_lon) * m_viewport.zoom + m_viewport.width * 0.5) +
+                         markerOffset.first;
+        const float sy = (float)((m_viewport.center_lat - slat) * m_viewport.zoom + m_viewport.height * 0.5) +
+                         markerOffset.second;
         const float dx = (float)mx - sx;
         const float dy = (float)my - sy;
         const float dist = dx * dx + dy * dy;

@@ -6,7 +6,7 @@ It is being built as a standalone successor to `cursdar`: same GPU-first mentali
 
 ## Highlights
 
-- Live NEXRAD Level 2 ingest from AWS
+- Live Level 2 ingest from AWS NEXRAD plus selected IEM-hosted experimental/testbed feeds
 - Fast single-site 2D rendering with working tilt stepping
 - National mosaic rendering across the radar network
 - Real-time 3D volume mode
@@ -15,6 +15,7 @@ It is being built as a standalone successor to `cursdar`: same GPU-first mentali
 - Archive snapshot loading, including the March 30, 2025 multi-site case
 - Live and historic warning polygons, watches, and related alert overlays
 - Custom basemap system with relief, ops-dark, satellite, and hybrid imagery modes
+- Support for Norman ROC/KCRI experimental feeds including `KCRI`, `DAN1`, `DOP1`, `FOP1`, `NOP3`, `NOP4`, `ROP3`, and `ROP4`
 - Highly configurable warning styling:
   - per-category toggles
   - outline/fill controls
@@ -50,6 +51,7 @@ Implemented now:
 - Standalone `cursdar2` source tree and build target
 - Live single-site view
 - Live national mosaic
+- Experimental/testbed radar site support alongside the core WSR-88D network
 - 3D volume rendering
 - Cross-sections
 - Tilt browsing in single-radar mode
@@ -129,6 +131,7 @@ chmod +x build.sh
 - The operator console exposes `Auto`, `Quality`, `Balanced`, and `Performance` profiles, plus current/peak VRAM and process RAM.
 - The warnings panel can show live or historic polygons depending on mode.
 - The basemap panel exposes relief, ops-dark, satellite, and hybrid map modes plus overlay controls.
+- `Ops Dark` is the default basemap for instant startup; imagery styles stream in on demand and fall back to cached parent tiles while sharper zoom levels load.
 - Color tables can be loaded from the operator console with a file browser.
 - Polling links are currently ingested and inspected, but not yet fully rendered as full GR-style placefile content.
 

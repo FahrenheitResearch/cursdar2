@@ -665,27 +665,62 @@ void BasemapRenderer::drawRasterTiles(ImDrawList* drawList, const Viewport& vp, 
     const ImU32 tint = IM_COL32(255, 255, 255,
         (int)std::lround(std::clamp(m_rasterOpacity, 0.0f, 1.0f) * 255.0f));
 
+    auto findReadyTile = [&](int targetZ, int targetX, int targetY,
+                             std::shared_ptr<TileEntry>& outEntry,
+                             float& outU0, float& outV0, float& outU1, float& outV1) -> bool {
+        std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+        for (int candidateZ = targetZ; candidateZ >= 0; --candidateZ) {
+            const int zoomDelta = targetZ - candidateZ;
+            const int candidateTilesPerAxis = 1 << candidateZ;
+            int candidateX = targetX >> zoomDelta;
+            int candidateY = targetY >> zoomDelta;
+            candidateX %= candidateTilesPerAxis;
+            if (candidateX < 0)
+                candidateX += candidateTilesPerAxis;
+            if (candidateY < 0 || candidateY >= candidateTilesPerAxis)
+                continue;
+
+            TileKey candidateKey{layer, candidateZ, candidateX, candidateY};
+            auto it = m_tiles.find(candidateKey);
+            if (it == m_tiles.end())
+                continue;
+
+            std::lock_guard<std::mutex> tileLock(it->second->mutex);
+            if (it->second->state != TileState::Ready || it->second->texture.textureId() == 0)
+                continue;
+
+            outEntry = it->second;
+            const float invScale = 1.0f / float(1 << zoomDelta);
+            const int localX = targetX - (candidateX << zoomDelta);
+            const int localY = targetY - (candidateY << zoomDelta);
+            outU0 = localX * invScale;
+            outV0 = localY * invScale;
+            outU1 = outU0 + invScale;
+            outV1 = outV0 + invScale;
+            return true;
+        }
+        return false;
+    };
+
     for (int ty = y0; ty <= y1; ty++) {
         for (int tx = x0; tx <= x1; tx++) {
             int wrappedX = tx % tilesPerAxis;
             if (wrappedX < 0)
                 wrappedX += tilesPerAxis;
-            TileKey key{layer, z, wrappedX, ty};
-
             std::shared_ptr<TileEntry> entry;
-            {
-                std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
-                auto it = m_tiles.find(key);
-                if (it == m_tiles.end())
-                    continue;
-                entry = it->second;
-            }
-
-            std::lock_guard<std::mutex> lock(entry->mutex);
-            if (entry->state != TileState::Ready || entry->texture.textureId() == 0)
+            float tileU0 = 0.0f;
+            float tileV0 = 0.0f;
+            float tileU1 = 1.0f;
+            float tileV1 = 1.0f;
+            if (!findReadyTile(z, wrappedX, ty, entry, tileU0, tileV0, tileU1, tileV1))
                 continue;
 
-            entry->lastTouch = std::chrono::steady_clock::now();
+            const auto textureId = entry->texture.textureId();
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                entry->lastTouch = std::chrono::steady_clock::now();
+            }
+
             for (int sy = 0; sy < kTileSubdivisions; sy++) {
                 for (int sx = 0; sx < kTileSubdivisions; sx++) {
                     const double u0 = (double)sx / (double)kTileSubdivisions;
@@ -711,13 +746,17 @@ void BasemapRenderer::drawRasterTiles(ImDrawList* drawList, const Viewport& vp, 
                         continue;
                     }
 
+                    const float drawU0 = tileU0 + (tileU1 - tileU0) * (float)u0;
+                    const float drawU1 = tileU0 + (tileU1 - tileU0) * (float)u1;
+                    const float drawV0 = tileV0 + (tileV1 - tileV0) * (float)v0;
+                    const float drawV1 = tileV0 + (tileV1 - tileV0) * (float)v1;
                     drawList->AddImageQuad(
-                        (ImTextureID)(uintptr_t)entry->texture.textureId(),
+                        (ImTextureID)(uintptr_t)textureId,
                         p00, p10, p11, p01,
-                        ImVec2((float)u0, (float)v0),
-                        ImVec2((float)u1, (float)v0),
-                        ImVec2((float)u1, (float)v1),
-                        ImVec2((float)u0, (float)v1),
+                        ImVec2(drawU0, drawV0),
+                        ImVec2(drawU1, drawV0),
+                        ImVec2(drawU1, drawV1),
+                        ImVec2(drawU0, drawV1),
                         tint);
                 }
             }

@@ -130,7 +130,7 @@ private:
     void drawStates(ImDrawList* drawList, const Viewport& vp, ImVec2 origin, const StylePalette& palette) const;
     void drawCities(ImDrawList* drawList, const Viewport& vp, ImVec2 origin, const StylePalette& palette) const;
 
-    BasemapStyle m_style = BasemapStyle::Relief;
+    BasemapStyle m_style = BasemapStyle::OpsDark;
     float m_rasterOpacity = 0.82f;
     float m_overlayOpacity = 1.0f;
     bool m_showStateLines = true;

@@ -19,36 +19,13 @@ namespace {
 std::string filenameFromKey(const std::string& key);
 
 bool extractFilenameTime(const std::string& fname, int& hh, int& mm, int& ss) {
-    const size_t dateEnd = fname.find('_');
-    if (dateEnd == std::string::npos || dateEnd + 7 > fname.size()) return false;
-
-    const std::string timeStr = fname.substr(dateEnd + 1, 6);
-    if (timeStr.size() != 6) return false;
-
-    hh = std::stoi(timeStr.substr(0, 2));
-    mm = std::stoi(timeStr.substr(2, 2));
-    ss = std::stoi(timeStr.substr(4, 2));
-    return true;
+    int year = 0, month = 0, day = 0;
+    return extractRadarFileDateTime(fname, year, month, day, hh, mm, ss);
 }
 
 bool extractKeyDateTime(const std::string& key, int& year, int& month, int& day,
                         int& hh, int& mm, int& ss) {
-    if (key.size() < 10) return false;
-    if (!std::isdigit((unsigned char)key[0]) || !std::isdigit((unsigned char)key[1]) ||
-        !std::isdigit((unsigned char)key[2]) || !std::isdigit((unsigned char)key[3]) ||
-        key[4] != '/' ||
-        !std::isdigit((unsigned char)key[5]) || !std::isdigit((unsigned char)key[6]) ||
-        key[7] != '/' ||
-        !std::isdigit((unsigned char)key[8]) || !std::isdigit((unsigned char)key[9])) {
-        return false;
-    }
-
-    year = std::stoi(key.substr(0, 4));
-    month = std::stoi(key.substr(5, 2));
-    day = std::stoi(key.substr(8, 2));
-    const size_t slash = key.rfind('/');
-    const std::string fname = (slash != std::string::npos) ? key.substr(slash + 1) : key;
-    return extractFilenameTime(fname, hh, mm, ss);
+    return extractRadarFileDateTime(key, year, month, day, hh, mm, ss);
 }
 
 int64_t makeUtcEpoch(int year, int month, int day, int hh, int mm, int ss) {
@@ -150,8 +127,7 @@ std::shared_ptr<RadarFrame> buildFrame(const ParsedRadarData& parsed, const std:
 }
 
 std::string filenameFromKey(const std::string& key) {
-    const size_t us = key.rfind('/');
-    return (us != std::string::npos) ? key.substr(us + 1) : key;
+    return radarFilenameFromKey(key);
 }
 
 } // namespace
@@ -255,61 +231,82 @@ bool HistoricLoader::startLoad(const std::string& label,
             m_lastError = std::move(error);
         };
 
-        // List all files for this station/date
-        std::string listPath = "/?list-type=2&prefix=" +
-            std::to_string(year) + "/" +
-            (month < 10 ? "0" : "") + std::to_string(month) + "/" +
-            (day < 10 ? "0" : "") + std::to_string(day) + "/" +
-            station + "/&max-keys=1000";
+        int stationIdx = -1;
+        for (int i = 0; i < NUM_NEXRAD_STATIONS; i++) {
+            if (station == NEXRAD_STATIONS[i].icao) {
+                stationIdx = i;
+                break;
+            }
+        }
+        StationInfo stationInfo = {};
+        if (stationIdx >= 0) {
+            stationInfo = NEXRAD_STATIONS[stationIdx];
+        } else {
+            stationInfo.icao = station.c_str();
+            stationInfo.name = station.c_str();
+            stationInfo.state = "";
+            stationInfo.feed = RadarFeedKind::AwsS3DatePartitioned;
+            stationInfo.feed_code = station.c_str();
+        }
 
-        auto listResult = Downloader::httpGet(NEXRAD_HOST, listPath);
-        if (!listResult.success) {
-            printf("Failed to list files: %s\n", listResult.error.c_str());
-            setError(listResult.error.empty()
-                ? "Archive listing failed"
-                : "Archive listing failed: " + listResult.error);
+        auto fetchList = [&](int y, int m, int d, std::vector<NexradFile>& outFiles) -> bool {
+            auto listResult = Downloader::httpGet(radarDataHost(stationInfo),
+                                                  buildRadarListRequest(stationInfo, y, m, d, {}));
+            if (!listResult.success || listResult.data.empty())
+                return false;
+            outFiles = parseRadarListResponse(stationInfo, listResult.data);
+            return !outFiles.empty();
+        };
+
+        std::vector<NexradFile> files;
+        if (!fetchList(year, month, day, files)) {
+            printf("Failed to list files for %s\n", station.c_str());
+            setError("Archive listing failed");
             finish(false);
             return;
         }
 
-        std::string xml(listResult.data.begin(), listResult.data.end());
-        auto files = parseS3ListResponse(xml);
+        auto makeUtcEpoch = [](int y, int mo, int d, int hh, int mi, int ss) -> int64_t {
+            std::tm tm = {};
+            tm.tm_year = y - 1900;
+            tm.tm_mon = mo - 1;
+            tm.tm_mday = d;
+            tm.tm_hour = hh;
+            tm.tm_min = mi;
+            tm.tm_sec = ss;
+#ifdef _WIN32
+            return static_cast<int64_t>(_mkgmtime(&tm));
+#else
+            return static_cast<int64_t>(timegm(&tm));
+#endif
+        };
 
-        // Filter by time range
-        std::vector<NexradFile> filtered;
-        for (const auto& f : files) {
-            int hh = 0, mm = 0, ss = 0;
-            if (!extractFilenameTime(filenameFromKey(f.key), hh, mm, ss)) continue;
-            HistoricEvent requestView = {"", "", year, month, day, start_hour, start_min, end_hour, end_min,
-                                         0.0f, 0.0f, 0.0f, ""};
-            if (inHistoricWindow(requestView, hh, mm))
-                filtered.push_back(f);
+        const int64_t startEpoch = makeUtcEpoch(year, month, day, start_hour, start_min, 0);
+        int endYear = year;
+        int endMonth = month;
+        int endDay = day;
+        if (end_hour < start_hour || (end_hour == start_hour && end_min < start_min))
+            shiftDate(endYear, endMonth, endDay, 1);
+        const int64_t endEpoch = makeUtcEpoch(endYear, endMonth, endDay, end_hour, end_min, 59);
+
+        // Also check next day for overnight date-partitioned feeds.
+        if (radarFeedUsesDatePartitionedListing(stationInfo) &&
+            (endYear != year || endMonth != month || endDay != day)) {
+            std::vector<NexradFile> files2;
+            if (fetchList(endYear, endMonth, endDay, files2))
+                files.insert(files.end(), files2.begin(), files2.end());
         }
 
-        // Also check next day for overnight events
-        if (end_hour < start_hour || (end_hour == start_hour && end_min < start_min)) {
-            int nextYear = year;
-            int nextMonth = month;
-            int nextDay = day;
-            shiftDate(nextYear, nextMonth, nextDay, 1);
-
-            std::string listPath2 = "/?list-type=2&prefix=" +
-                std::to_string(nextYear) + "/" +
-                (nextMonth < 10 ? "0" : "") + std::to_string(nextMonth) + "/" +
-                (nextDay < 10 ? "0" : "") + std::to_string(nextDay) + "/" +
-                station + "/&max-keys=1000";
-
-            auto list2 = Downloader::httpGet(NEXRAD_HOST, listPath2);
-            if (list2.success) {
-                std::string xml2(list2.data.begin(), list2.data.end());
-                auto files2 = parseS3ListResponse(xml2);
-                for (const auto& f : files2) {
-                    int hh = 0, mm = 0, ss = 0;
-                    if (!extractFilenameTime(filenameFromKey(f.key), hh, mm, ss)) continue;
-                    if (hh * 60 + mm <= end_hour * 60 + end_min)
-                        filtered.push_back(f);
-                }
-            }
+        std::vector<NexradFile> filtered;
+        filtered.reserve(files.size());
+        for (const auto& f : files) {
+            int fy = 0, fm = 0, fd = 0;
+            int hh = 0, mm = 0, ss = 0;
+            if (!extractKeyDateTime(f.key, fy, fm, fd, hh, mm, ss))
+                continue;
+            const int64_t epoch = makeUtcEpoch(fy, fm, fd, hh, mm, ss);
+            if (epoch >= startEpoch && epoch <= endEpoch)
+                filtered.push_back(f);
         }
 
         if (filtered.empty()) {
@@ -342,7 +339,8 @@ bool HistoricLoader::startLoad(const std::string& label,
             auto& nf = filtered[i];
             int idx = i;
 
-            downloader->queueDownload(nf.key, NEXRAD_HOST, "/" + nf.key,
+            downloader->queueDownload(nf.key, radarDataHost(stationInfo),
+                                      buildRadarDownloadRequest(stationInfo, nf.key),
                 [this, idx, cb](const std::string& id, DownloadResult result) {
                     if (m_cancel.load()) return;
 

@@ -928,6 +928,8 @@ void render(App& app) {
         ImGui::SameLine();
 
         std::string label = st.icao + "  " + NEXRAD_STATIONS[i].name;
+        if (NEXRAD_STATIONS[i].experimental)
+            label += "  [EXP]";
         ImGui::PushStyleColor(ImGuiCol_Text, color);
         if (ImGui::Selectable(label.c_str(), i == app.activeStation()))
             app.selectStation(i, true, 200.0);
@@ -937,6 +939,8 @@ void render(App& app) {
         if (ImGui::IsItemHovered()) {
             ImGui::BeginTooltip();
             ImGui::Text("%s (%s)", NEXRAD_STATIONS[i].name, NEXRAD_STATIONS[i].state);
+            if (NEXRAD_STATIONS[i].experimental)
+                ImGui::TextDisabled("Experimental / testbed feed");
             ImGui::Text("%s", st.enabled ? "Enabled for live refresh" : "Disabled / idle");
             ImGui::Text("Lat: %.4f  Lon: %.4f", st.display_lat, st.display_lon);
             if (!st.latest_scan_utc.empty())
@@ -1014,6 +1018,8 @@ void render(App& app) {
                                       : ImVec4(0.7f, 0.7f, 0.74f, 1.0f),
                            st.enabled ? "[ENABLED]" : "[DISABLED]");
         ImGui::Text("Lat %.4f  Lon %.4f", st.display_lat, st.display_lon);
+        if (NEXRAD_STATIONS[inspectorStation].experimental)
+            ImGui::TextDisabled("Experimental / testbed feed");
         if (!st.latest_scan_utc.empty())
             ImGui::Text("Latest scan: %s", st.latest_scan_utc.c_str());
         if (ImGui::Button(st.enabled ? "Disable Site" : "Enable Site", ImVec2(210, 24)))
