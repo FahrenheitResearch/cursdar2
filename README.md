@@ -14,6 +14,7 @@ It is being built as a standalone successor to `cursdar`: same GPU-first mentali
 - Historic case playback with frame scrubbing
 - Archive snapshot loading, including the March 30, 2025 multi-site case
 - Live and historic warning polygons, watches, and related alert overlays
+- Custom basemap system with relief, ops-dark, satellite, and hybrid imagery modes
 - Highly configurable warning styling:
   - per-category toggles
   - outline/fill controls
@@ -57,10 +58,11 @@ Implemented now:
 - Live warning overlays
 - Historic warning overlays matched to archive timestamps
 - Warning customization controls
+- Custom basemap renderer with vector overlays and cached raster imagery
 - Color table import and per-product reset
 - Polling-link fetch and inspection
 - CUDA-backed rendering pipeline
-- Performance profiles with lower internal render resolution, lighter 3D quality, and reduced archive caching
+- Performance profiles with lighter 3D quality and reduced archive caching
 
 Not finished yet:
 
@@ -126,6 +128,7 @@ chmod +x build.sh
 - The inspector shows the latest scan time for the active site.
 - The operator console exposes `Auto`, `Quality`, `Balanced`, and `Performance` profiles, plus current/peak VRAM and process RAM.
 - The warnings panel can show live or historic polygons depending on mode.
+- The basemap panel exposes relief, ops-dark, satellite, and hybrid map modes plus overlay controls.
 - Color tables can be loaded from the operator console with a file browser.
 - Polling links are currently ingested and inspected, but not yet fully rendered as full GR-style placefile content.
 

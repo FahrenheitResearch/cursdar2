@@ -8,6 +8,7 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -96,6 +97,8 @@ private:
         GlTexture2D texture;
         std::string error;
         std::chrono::steady_clock::time_point lastTouch = {};
+        std::chrono::steady_clock::time_point nextRetry = {};
+        int failureCount = 0;
     };
 
     struct StylePalette {
@@ -118,6 +121,9 @@ private:
     void uploadDecodedTiles();
     void trimCache();
     void touchVisibleTile(const TileKey& key);
+    bool loadTileFromDiskCache(const TileKey& key, TileEntry& entry);
+    void storeTileToDiskCache(const TileKey& key, const std::vector<uint8_t>& bytes);
+    std::filesystem::path tileCachePath(const TileKey& key) const;
     void drawRasterTiles(ImDrawList* drawList, const Viewport& vp, ImVec2 origin);
     void drawGradientBackdrop(ImDrawList* drawList, const Viewport& vp, ImVec2 origin, const StylePalette& palette);
     void drawGrid(ImDrawList* drawList, const Viewport& vp, ImVec2 origin, const StylePalette& palette) const;
@@ -134,6 +140,7 @@ private:
     Downloader m_downloader;
     mutable std::mutex m_cacheMutex;
     std::unordered_map<TileKey, std::shared_ptr<TileEntry>, TileKeyHash> m_tiles;
+    std::filesystem::path m_diskCacheDir;
 
     std::string m_attribution;
     std::string m_status;

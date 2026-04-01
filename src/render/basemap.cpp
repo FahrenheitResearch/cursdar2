@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ constexpr double kMercatorMaxLat = 85.05112878;
 constexpr int kTileSize = 256;
 constexpr int kTileSubdivisions = 4;
 constexpr size_t kMaxTileCacheEntries = 320;
+constexpr auto kRetryCooldown = std::chrono::seconds(12);
 
 struct RasterSourceInfo {
     const char* service = "";
@@ -98,6 +100,27 @@ const RasterSourceInfo* rasterSource(BasemapRenderer::RasterLayer layer) {
 }
 
 #ifdef _WIN32
+struct WicThreadContext {
+    HRESULT initHr = E_FAIL;
+    IWICImagingFactory* factory = nullptr;
+
+    WicThreadContext() {
+        initHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool usable = SUCCEEDED(initHr) || initHr == RPC_E_CHANGED_MODE;
+        if (!usable)
+            return;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                         CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    }
+
+    ~WicThreadContext() {
+        if (factory)
+            factory->Release();
+        if (SUCCEEDED(initHr))
+            CoUninitialize();
+    }
+};
+
 bool decodeImageRgba(const std::vector<uint8_t>& bytes,
                      std::vector<unsigned char>& rgba,
                      int& width, int& height,
@@ -110,10 +133,12 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
         return false;
     }
 
-    HRESULT initHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool shouldUninit = SUCCEEDED(initHr);
+    thread_local WicThreadContext wic;
+    if (!wic.factory) {
+        error = "WIC factory unavailable";
+        return false;
+    }
 
-    IWICImagingFactory* factory = nullptr;
     IWICStream* stream = nullptr;
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
@@ -123,19 +148,9 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
         error = std::string(message) + " (0x" + std::to_string((unsigned long)hr) + ")";
     };
 
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) {
-        fail("CoCreateInstance(WIC) failed", hr);
-        if (shouldUninit) CoUninitialize();
-        return false;
-    }
-
-    hr = factory->CreateStream(&stream);
+    HRESULT hr = wic.factory->CreateStream(&stream);
     if (FAILED(hr)) {
         fail("CreateStream failed", hr);
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
@@ -143,17 +158,13 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
     if (FAILED(hr)) {
         fail("InitializeFromMemory failed", hr);
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
-    hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    hr = wic.factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
     if (FAILED(hr)) {
         fail("CreateDecoderFromStream failed", hr);
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
@@ -162,8 +173,6 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
         fail("GetFrame failed", hr);
         decoder->Release();
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
@@ -175,19 +184,15 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
         frame->Release();
         decoder->Release();
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
-    hr = factory->CreateFormatConverter(&converter);
+    hr = wic.factory->CreateFormatConverter(&converter);
     if (FAILED(hr)) {
         fail("CreateFormatConverter failed", hr);
         frame->Release();
         decoder->Release();
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
@@ -200,8 +205,6 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
         frame->Release();
         decoder->Release();
         stream->Release();
-        factory->Release();
-        if (shouldUninit) CoUninitialize();
         return false;
     }
 
@@ -220,8 +223,6 @@ bool decodeImageRgba(const std::vector<uint8_t>& bytes,
     frame->Release();
     decoder->Release();
     stream->Release();
-    factory->Release();
-    if (shouldUninit) CoUninitialize();
     return SUCCEEDED(hr);
 }
 #else
@@ -254,6 +255,19 @@ const char* basemapStyleLabel(BasemapStyle style) {
 
 BasemapRenderer::BasemapRenderer()
     : m_downloader(8) {
+#ifdef _WIN32
+    char localAppData[MAX_PATH] = "";
+    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, (DWORD)sizeof(localAppData));
+    if (len > 0 && len < sizeof(localAppData)) {
+        m_diskCacheDir = std::filesystem::path(localAppData) / "cursdar2" / "basemap_cache";
+    } else {
+        m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar2_basemap_cache";
+    }
+#else
+    m_diskCacheDir = std::filesystem::temp_directory_path() / "cursdar2_basemap_cache";
+#endif
+    std::error_code ec;
+    std::filesystem::create_directories(m_diskCacheDir, ec);
     updateAttribution();
 }
 
@@ -366,6 +380,62 @@ void BasemapRenderer::touchVisibleTile(const TileKey& key) {
     it->second->lastTouch = std::chrono::steady_clock::now();
 }
 
+std::filesystem::path BasemapRenderer::tileCachePath(const TileKey& key) const {
+    const RasterSourceInfo* source = rasterSource(key.layer);
+    const std::string service = source ? source->service : "unknown";
+    return m_diskCacheDir /
+           service /
+           std::to_string(key.z) /
+           std::to_string(key.x) /
+           (std::to_string(key.y) + ".tile");
+}
+
+bool BasemapRenderer::loadTileFromDiskCache(const TileKey& key, TileEntry& entry) {
+    std::error_code ec;
+    const std::filesystem::path path = tileCachePath(key);
+    if (!std::filesystem::exists(path, ec))
+        return false;
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    if (bytes.empty())
+        return false;
+
+    std::vector<unsigned char> rgba;
+    int width = 0;
+    int height = 0;
+    std::string decodeError;
+    if (!decodeImageRgba(bytes, rgba, width, height, decodeError))
+        return false;
+
+    entry.width = width;
+    entry.height = height;
+    entry.rgba = std::move(rgba);
+    entry.state = TileState::Decoded;
+    entry.error.clear();
+    entry.failureCount = 0;
+    entry.nextRetry = {};
+    return true;
+}
+
+void BasemapRenderer::storeTileToDiskCache(const TileKey& key, const std::vector<uint8_t>& bytes) {
+    if (bytes.empty())
+        return;
+
+    std::error_code ec;
+    const std::filesystem::path path = tileCachePath(key);
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return;
+    out.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+}
+
 void BasemapRenderer::queueTileRequest(const TileKey& key) {
     const RasterSourceInfo* source = rasterSource(key.layer);
     if (!source)
@@ -388,10 +458,12 @@ void BasemapRenderer::queueTileRequest(const TileKey& key) {
             entry->lastTouch = now;
             return;
         }
+        if (loadTileFromDiskCache(key, *entry)) {
+            entry->lastTouch = now;
+            return;
+        }
         if (entry->state == TileState::Failed) {
-            const float retryAge =
-                std::chrono::duration<float>(now - entry->lastTouch).count();
-            if (retryAge < 15.0f)
+            if (now < entry->nextRetry)
                 return;
         }
         entry->state = TileState::Queued;
@@ -410,7 +482,7 @@ void BasemapRenderer::queueTileRequest(const TileKey& key) {
                              std::to_string(key.x);
 
     m_downloader.queueDownload(id, "basemap.nationalmap.gov", path,
-        [entry](const std::string&, DownloadResult result) {
+        [this, key, entry](const std::string&, DownloadResult result) {
             std::vector<unsigned char> rgba;
             int width = 0;
             int height = 0;
@@ -419,6 +491,8 @@ void BasemapRenderer::queueTileRequest(const TileKey& key) {
             if (!result.success) {
                 std::lock_guard<std::mutex> lock(entry->mutex);
                 entry->state = TileState::Failed;
+                entry->failureCount++;
+                entry->nextRetry = std::chrono::steady_clock::now() + kRetryCooldown;
                 entry->error = result.error.empty()
                     ? ("HTTP " + std::to_string(result.status_code))
                     : result.error;
@@ -428,15 +502,22 @@ void BasemapRenderer::queueTileRequest(const TileKey& key) {
             if (!decodeImageRgba(result.data, rgba, width, height, decodeError)) {
                 std::lock_guard<std::mutex> lock(entry->mutex);
                 entry->state = TileState::Failed;
+                entry->failureCount++;
+                entry->nextRetry = std::chrono::steady_clock::now() + kRetryCooldown;
                 entry->error = decodeError;
                 return;
             }
+
+            storeTileToDiskCache(key, result.data);
 
             std::lock_guard<std::mutex> lock(entry->mutex);
             entry->width = width;
             entry->height = height;
             entry->rgba = std::move(rgba);
             entry->state = TileState::Decoded;
+            entry->failureCount = 0;
+            entry->nextRetry = {};
+            entry->error.clear();
         });
 }
 
@@ -524,7 +605,25 @@ void BasemapRenderer::update(const Viewport& vp) {
     requestVisibleTiles(vp);
     uploadDecodedTiles();
     trimCache();
-    m_status = (m_downloader.pending() > 0) ? "Fetching basemap tiles..." : "";
+
+    int failedCount = 0;
+    {
+        std::lock_guard<std::mutex> cacheLock(m_cacheMutex);
+        for (const auto& kv : m_tiles) {
+            std::lock_guard<std::mutex> tileLock(kv.second->mutex);
+            failedCount += (kv.second->state == TileState::Failed) ? 1 : 0;
+        }
+    }
+
+    if (m_downloader.pending() > 0) {
+        m_status = "Fetching basemap tiles...";
+        if (failedCount > 0)
+            m_status += " " + std::to_string(failedCount) + " retrying.";
+    } else if (failedCount > 0) {
+        m_status = std::to_string(failedCount) + " basemap tile retries pending";
+    } else {
+        m_status.clear();
+    }
 }
 
 void BasemapRenderer::drawGradientBackdrop(ImDrawList* drawList, const Viewport& vp,
