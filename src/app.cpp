@@ -3663,6 +3663,7 @@ void App::update(float dt) {
                 }
             }
         }
+        m_basemap.update(m_viewport);
         return;
     }
 
@@ -3692,6 +3693,7 @@ void App::update(float dt) {
 
     processLiveLoopBackfill();
     updateLiveLoop(dt);
+    m_basemap.update(m_viewport);
 }
 
 void App::render() {
@@ -3800,11 +3802,11 @@ void App::render() {
                                           m_activeProduct, activeThreshold,
                                           m_d_compositeOutput, srvSpd, srvDir);
             } else {
-                CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0x0F,
+                CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0,
                             (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
             }
         } else {
-            CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0x0F,
+            CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0,
                         (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
         }
 

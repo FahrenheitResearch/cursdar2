@@ -85,8 +85,10 @@ add_executable(cursdar2
     src/net/downloader.cpp
     src/net/polling_links.cpp
     src/net/warnings.cpp
+    src/render/basemap.cpp
     src/render/color_table.cpp
     src/render/gl_interop.cpp
+    src/render/gl_texture.cpp
     src/ui/ui.cpp
     src/cuda/renderer.cu
     src/cuda/preprocess.cu
@@ -114,7 +116,7 @@ target_link_libraries(cursdar2 PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(cursdar2 PRIVATE opengl32 winhttp psapi)
+    target_link_libraries(cursdar2 PRIVATE opengl32 winhttp psapi ole32 windowscodecs)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(cursdar2 PRIVATE GL CURL::libcurl dl pthread)

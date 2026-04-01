@@ -3,6 +3,7 @@
 #include "nexrad/products.h"
 #include "cuda/renderer.cuh"
 #include "render/gl_interop.h"
+#include "render/basemap.h"
 #include "render/color_table.h"
 #include "render/projection.h"
 #include "cuda/volume3d.cuh"
@@ -224,6 +225,8 @@ public:
     void            setPerformanceProfile(PerformanceProfile profile);
     void            resetMemoryPeaks();
     const std::string& gpuName() const { return m_gpuName; }
+    BasemapRenderer& basemap() { return m_basemap; }
+    const BasemapRenderer& basemap() const { return m_basemap; }
     std::vector<WarningPolygon> currentWarnings() const;
     bool            loadColorTableFromFile(const std::string& path);
     void            resetColorTable(int product = -1);
@@ -370,6 +373,7 @@ private:
     // GPU compositor output
     uint32_t*       m_d_compositeOutput = nullptr;
     GlCudaTexture   m_outputTex;
+    BasemapRenderer m_basemap;
 
     // Spatial grid for fast station lookup in compositor
     std::unique_ptr<SpatialGrid> m_spatialGrid;

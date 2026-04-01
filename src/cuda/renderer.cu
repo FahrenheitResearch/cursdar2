@@ -67,7 +67,7 @@ __device__ __host__ static uint32_t makeRGBA(uint8_t r, uint8_t g, uint8_t b, ui
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
 }
 
-constexpr uint32_t kBackgroundColor = 0xFF140F0Fu;
+constexpr uint32_t kBackgroundColor = 0x00140F0Fu;
 constexpr uint64_t kEmptyForwardPixel = ~0ull;
 
 __device__ __host__ static float angleDiffDeg(float a, float b) {

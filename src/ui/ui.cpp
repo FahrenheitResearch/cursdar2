@@ -5,7 +5,6 @@
 #include "net/aws_nexrad.h"
 #include "historic.h"
 #include "net/warnings.h"
-#include "data/us_boundaries.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -287,6 +286,7 @@ void render(App& app) {
 
     // Background radar image
     auto* drawList = ImGui::GetBackgroundDrawList();
+    app.basemap().drawBase(drawList, vp, mainViewport->Pos);
     drawList->AddImage(
         (ImTextureID)(uintptr_t)app.outputTexture().textureId(),
         mainViewport->Pos,
@@ -294,47 +294,11 @@ void render(App& app) {
                mainViewport->Pos.y + mainViewport->Size.y));
 
     // ── State boundaries ─────────────────────────────────────
-    {
-        auto* bdl = ImGui::GetBackgroundDrawList();
-        ImU32 lineCol = IM_COL32(50, 50, 70, 140);
-        for (int i = 0; i < US_STATE_LINE_COUNT; i++) {
-            float lat1 = US_STATE_LINES[i*4+0], lon1 = US_STATE_LINES[i*4+1];
-            float lat2 = US_STATE_LINES[i*4+2], lon2 = US_STATE_LINES[i*4+3];
-            float sx1 = (float)((lon1 - vp.center_lon) * vp.zoom + vp.width * 0.5);
-            float sy1 = (float)((vp.center_lat - lat1) * vp.zoom + vp.height * 0.5);
-            float sx2 = (float)((lon2 - vp.center_lon) * vp.zoom + vp.width * 0.5);
-            float sy2 = (float)((vp.center_lat - lat2) * vp.zoom + vp.height * 0.5);
-            // Coarse viewport cull
-            if (sx1 < -50 && sx2 < -50) continue;
-            if (sx1 > vp.width+50 && sx2 > vp.width+50) continue;
-            if (sy1 < -50 && sy2 < -50) continue;
-            if (sy1 > vp.height+50 && sy2 > vp.height+50) continue;
-            bdl->AddLine(ImVec2(sx1,sy1), ImVec2(sx2,sy2), lineCol, 1.0f);
-        }
-    }
 
     // ── City labels (zoom-dependent) ────────────────────────
-    {
-        auto* cdl = ImGui::GetBackgroundDrawList();
-        // Determine population threshold based on zoom
-        int popThreshold = 1000000;  // very zoomed out: only mega cities
-        if (vp.zoom > 40) popThreshold = 500000;
-        if (vp.zoom > 80) popThreshold = 200000;
-        if (vp.zoom > 150) popThreshold = 100000;
-        if (vp.zoom > 300) popThreshold = 50000;
-
-        for (int i = 0; i < US_CITY_COUNT; i++) {
-            if (US_CITIES[i].population < popThreshold) continue;
-            float sx = (float)((US_CITIES[i].lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
-            float sy = (float)((vp.center_lat - US_CITIES[i].lat) * vp.zoom + vp.height * 0.5);
-            if (sx < -50 || sx > vp.width+50 || sy < -50 || sy > vp.height+50) continue;
-            cdl->AddCircleFilled(ImVec2(sx, sy), 2.0f, IM_COL32(200, 200, 220, 180));
-            cdl->AddText(ImVec2(sx + 5, sy - 7), IM_COL32(200, 200, 220, 160),
-                         US_CITIES[i].name);
-        }
-    }
 
     // ── Range rings + azimuth lines ─────────────────────────
+    app.basemap().drawOverlay(drawList, vp, mainViewport->Pos);
     {
         int asi = app.activeStation();
         float slat = 0, slon = 0;
@@ -595,6 +559,44 @@ void render(App& app) {
         ImGui::Text("3D Volume Working Set: %s", formatBytes(mem.volume_working_set_bytes).c_str());
         if (ImGui::Button("Reset Memory Peaks", ImVec2(210, 24)))
             app.resetMemoryPeaks();
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Basemap", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kBasemapItems[] = {
+            "Relief",
+            "Ops Dark",
+            "Satellite",
+            "Satellite Hybrid"
+        };
+        int basemapStyle = (int)app.basemap().style();
+        ImGui::SetNextItemWidth(210);
+        if (ImGui::Combo("Style", &basemapStyle, kBasemapItems, IM_ARRAYSIZE(kBasemapItems)))
+            app.basemap().setStyle((BasemapStyle)basemapStyle);
+
+        float rasterOpacity = app.basemap().rasterOpacity();
+        if (ImGui::SliderFloat("Raster Opacity", &rasterOpacity, 0.10f, 1.0f, "%.2f"))
+            app.basemap().setRasterOpacity(rasterOpacity);
+
+        float overlayOpacity = app.basemap().overlayOpacity();
+        if (ImGui::SliderFloat("Overlay Opacity", &overlayOpacity, 0.20f, 1.0f, "%.2f"))
+            app.basemap().setOverlayOpacity(overlayOpacity);
+
+        bool showStates = app.basemap().showStateLines();
+        if (ImGui::Checkbox("State Lines", &showStates))
+            app.basemap().setShowStateLines(showStates);
+        bool showCities = app.basemap().showCityLabels();
+        if (ImGui::Checkbox("City Labels", &showCities))
+            app.basemap().setShowCityLabels(showCities);
+        bool showGrid = app.basemap().showGrid();
+        if (ImGui::Checkbox("Lat/Lon Grid", &showGrid))
+            app.basemap().setShowGrid(showGrid);
+
+        ImGui::TextWrapped("%s", app.basemap().attribution().c_str());
+        const std::string& basemapStatus = app.basemap().status();
+        if (!basemapStatus.empty())
+            ImGui::TextDisabled("%s", basemapStatus.c_str());
     }
 
     ImGui::Separator();
@@ -1295,6 +1297,21 @@ void render(App& app) {
     }
 
     // ── Keyboard shortcuts ──────────────────────────────────
+    {
+        const std::string& basemapAttribution = app.basemap().attribution();
+        if (!basemapAttribution.empty()) {
+            auto* adl = ImGui::GetBackgroundDrawList();
+            ImVec2 textSize = ImGui::CalcTextSize(basemapAttribution.c_str());
+            ImVec2 tl(mainViewport->Pos.x + 14.0f,
+                      mainViewport->Pos.y + mainViewport->Size.y - textSize.y - 18.0f);
+            ImVec2 br(tl.x + textSize.x + 10.0f, tl.y + textSize.y + 6.0f);
+            adl->AddRectFilled(tl, br, IM_COL32(6, 10, 16, 168), 4.0f);
+            adl->AddText(ImVec2(tl.x + 5.0f, tl.y + 3.0f),
+                         IM_COL32(220, 228, 238, 210),
+                         basemapAttribution.c_str());
+        }
+    }
+
     if (!ImGui::GetIO().WantCaptureKeyboard) {
         // Number keys: direct product select
         for (int i = 0; i < (int)Product::COUNT; i++) {
