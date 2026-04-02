@@ -95,8 +95,39 @@ int countSetBits(uint32_t value) {
 
 int estimateMaxParsedRadials(size_t raw_size) {
     const size_t estimate = raw_size / 1216 + 1024;
-    const size_t clamped = std::max<size_t>(8192, std::min<size_t>(estimate, 65536));
-    return (int)clamped;
+    return (int)std::max<size_t>(4096, estimate);
+}
+
+int absoluteMaxParsedRadials(size_t raw_size) {
+    // MSG31 records are variable length, but if the estimate still truncates we
+    // keep growing until we can hold one slot per ~64 decoded bytes. That is
+    // intentionally conservative and avoids silently clamping large volumes.
+    return (int)std::max<size_t>(estimateMaxParsedRadials(raw_size), raw_size / 64 + 4096);
+}
+
+int parseWithResize(const uint8_t* d_raw_data, size_t raw_size,
+                    GpuParsedRadial*& d_radials_out, size_t& radial_capacity,
+                    PipelineScratch& scratch, cudaStream_t activeStream,
+                    bool* out_truncated) {
+    const int hardLimit = absoluteMaxParsedRadials(raw_size);
+    int maxParsed = estimateMaxParsedRadials(raw_size);
+    bool truncated = false;
+    int num_parsed = 0;
+
+    while (true) {
+        ensureCapacity(d_radials_out, radial_capacity, (size_t)maxParsed);
+        ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)maxParsed);
+        num_parsed = parseOnGpu(d_raw_data, raw_size, d_radials_out, maxParsed,
+                                activeStream, &truncated);
+        CUDA_CHECK(cudaStreamSynchronize(activeStream));
+        if (!truncated || maxParsed >= hardLimit)
+            break;
+        maxParsed = std::min(hardLimit, std::max(maxParsed + maxParsed / 2, maxParsed + 4096));
+    }
+
+    if (out_truncated)
+        *out_truncated = truncated;
+    return num_parsed;
 }
 
 } // namespace
@@ -642,15 +673,10 @@ GpuIngestResult ingestSweepGpu(const uint8_t* h_raw_data, size_t raw_size,
                                 cudaMemcpyHostToDevice, activeStream));
 
     // Parse on GPU
-    const int maxParsed = estimateMaxParsedRadials(raw_size);
-    ensureCapacity(scratch.d_radials, scratch.radial_capacity, maxParsed);
-    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)maxParsed);
-
-    CUDA_CHECK(cudaStreamSynchronize(activeStream));
     bool truncated = false;
-    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, maxParsed,
-                                activeStream, &truncated);
-    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    int num_parsed = parseWithResize(scratch.d_raw, raw_size,
+                                     scratch.d_radials, scratch.radial_capacity,
+                                     scratch, activeStream, &truncated);
     result.truncated = truncated;
     result.parsed = num_parsed > 0 && !truncated;
 
@@ -762,19 +788,15 @@ GpuVolumeIngestResult ingestVolumeGpu(const uint8_t* h_raw_data, size_t raw_size
     CUDA_CHECK(cudaMemcpyAsync(scratch.d_raw, h_raw_data, raw_size,
                                cudaMemcpyHostToDevice, activeStream));
 
-    const int maxParsed = estimateMaxParsedRadials(raw_size);
-    ensureCapacity(scratch.d_radials, scratch.radial_capacity, maxParsed);
-    ensureCapacity(scratch.d_indices, scratch.index_capacity, (size_t)maxParsed);
     ensureCapacity(scratch.d_lowest_key, scratch.lowest_key_capacity, (size_t)1);
     ensureCapacity(scratch.d_sweep_bits, scratch.sweep_bits_capacity, (size_t)8);
     ensureCapacity(scratch.d_selected_count, scratch.selected_count_capacity, (size_t)1);
     ensureCapacity(scratch.d_product_meta, scratch.product_meta_capacity, (size_t)NUM_PRODUCTS);
 
-    CUDA_CHECK(cudaStreamSynchronize(activeStream));
     bool truncated = false;
-    int num_parsed = parseOnGpu(scratch.d_raw, raw_size, scratch.d_radials, maxParsed,
-                                activeStream, &truncated);
-    CUDA_CHECK(cudaStreamSynchronize(activeStream));
+    int num_parsed = parseWithResize(scratch.d_raw, raw_size,
+                                     scratch.d_radials, scratch.radial_capacity,
+                                     scratch, activeStream, &truncated);
     volume.truncated = truncated;
     volume.parsed = num_parsed > 0 && !truncated;
     if (num_parsed <= 0 || truncated)

@@ -134,10 +134,18 @@ struct MemoryTelemetry {
 };
 
 struct LiveLoopBackfillFrame {
+    std::string volume_key;
     std::string label;
     std::vector<PrecomputedSweep> sweeps;
     float station_lat = 0.0f;
     float station_lon = 0.0f;
+    int product = PROD_REF;
+    int tilt = 0;
+    bool srv_mode = false;
+    float storm_speed = 0.0f;
+    float storm_dir = 0.0f;
+    float dbz_threshold = 0.0f;
+    float velocity_threshold = 0.0f;
 };
 
 struct ProbSevereObject {
@@ -283,6 +291,12 @@ public:
     void            setLiveLoopSpeed(float fps);
     bool            liveLoopViewingHistory() const;
     std::string     liveLoopCurrentLabel() const;
+    std::string     liveLoopLabelAtFrame(int index) const;
+    std::string     liveLoopVolumeKeyAtFrame(int index) const;
+    bool            liveLoopBackfillLoading() const { return m_liveLoopBackfillLoading.load(); }
+    int             liveLoopBackfillPendingFrames() const { return m_liveLoopBackfillQueueCount.load(); }
+    int             liveLoopBackfillFetchTotal() const { return m_liveLoopBackfillFetchTotal.load(); }
+    int             liveLoopBackfillFetchCompleted() const { return m_liveLoopBackfillFetchCompleted.load(); }
     void            clearLiveLoop();
     bool            stationEnabled(int idx) const;
     void            setStationEnabled(int idx, bool enabled);
@@ -335,6 +349,7 @@ private:
     // Build spatial grid for compositor
     void buildSpatialGrid();
     void invalidateFrameCache(bool freeMemory = false);
+    void resetHistoricFrameCache(bool freeMemory = false);
     void ensureCrossSectionBuffer(int width, int height);
     void rebuildVolumeForCurrentSelection();
     bool stationUploadMatchesSelection(const StationState& st) const;
@@ -370,10 +385,16 @@ private:
     void invalidateLiveLoop(bool freeMemory = false);
     void requestLiveLoopCapture();
     void updateLiveLoop(float dt);
-    void captureLiveLoopFrame(const uint32_t* d_src, int w, int h, const std::string& label);
+    void captureLiveLoopFrame(const uint32_t* d_src, int w, int h,
+                              const std::string& label,
+                              const std::string& volumeKey = {});
     int liveLoopSlotForIndex(int index) const;
     std::string currentLiveLoopCaptureLabel() const;
     void requestLiveLoopBackfill();
+    void requestLiveLoopBackfillForViewRefresh();
+    void requestLiveLoopBackfillImpl(bool allowDownload);
+    void queueLiveLoopFramesFromHistory(int stationIdx, int desiredFrames, bool replaceExisting);
+    void scheduleInteractiveLiveLoopBackfill();
     void processLiveLoopBackfill();
     void resetLiveLoopFrameCache(bool freeMemory);
     int stationLiveHistoryLimitLocked(int stationIdx) const;
@@ -395,6 +416,9 @@ private:
                               float stationLat, float stationLon,
                               int product, int tilt,
                               float* outElevationAngle = nullptr) const;
+    bool uploadLiveLoopFrameToSlot(int slot, const std::string& volumeKey,
+                                   int product, int tilt,
+                                   float* outElevationAngle = nullptr);
     bool ensurePanelCacheUpload(int paneIndex, int product, int tilt,
                                 float* outElevationAngle = nullptr);
     void invalidatePanelCaches();
@@ -570,7 +594,7 @@ public:
     }
 
     // Rolling live loop cache
-    static constexpr int MAX_LIVE_LOOP_FRAMES = 30;
+    static constexpr int MAX_LIVE_LOOP_FRAMES = 500;
     bool m_liveLoopEnabled = false;
     bool m_liveLoopPlaying = false;
     int m_liveLoopLength = 8;
@@ -582,11 +606,18 @@ public:
     bool m_liveLoopCapturePending = false;
     uint32_t* m_liveLoopFrames[MAX_LIVE_LOOP_FRAMES] = {};
     std::string m_liveLoopLabels[MAX_LIVE_LOOP_FRAMES];
+    std::string m_liveLoopVolumeKeys[MAX_LIVE_LOOP_FRAMES];
     int m_liveLoopFrameWidth = 0;
     int m_liveLoopFrameHeight = 0;
     std::deque<LiveLoopBackfillFrame> m_liveLoopBackfillQueue;
     std::mutex m_liveLoopBackfillMutex;
     std::atomic<bool> m_liveLoopBackfillLoading{false};
     std::atomic<uint64_t> m_liveLoopBackfillGeneration{0};
+    std::atomic<int> m_liveLoopBackfillQueueCount{0};
+    std::atomic<int> m_liveLoopBackfillFetchTotal{0};
+    std::atomic<int> m_liveLoopBackfillFetchCompleted{0};
     bool m_liveLoopBackfillReplaceExisting = false;
+    int m_liveLoopBackfillDeferFrames = 0;
+    bool m_liveLoopInteractiveBackfill = false;
+    std::atomic<bool> m_liveLoopLocalRefreshPending{false};
 };

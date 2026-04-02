@@ -29,6 +29,8 @@ namespace ui {
 
 namespace {
 
+bool g_uiWantsMouseCapture = false;
+
 void resetConusView(App& app) {
     app.viewport().center_lat = 39.0;
     app.viewport().center_lon = -98.0;
@@ -95,6 +97,208 @@ std::string formatBytes(size_t bytes) {
     else
         std::snprintf(buffer, sizeof(buffer), "%.2f %s", value, kUnits[unit]);
     return buffer;
+}
+
+void drawLiveLoopTimeline(App& app, const char* id, float height = 26.0f) {
+    const int targetFrames = std::max(1, app.liveLoopLength());
+    const int availableFrames = std::max(0, app.liveLoopAvailableFrames());
+    const int loadedStartSlot = std::max(0, targetFrames - availableFrames);
+    const int playbackFrame = std::clamp(app.liveLoopPlaybackFrame(), 0, std::max(0, availableFrames - 1));
+    const int currentSlot = (availableFrames > 0)
+        ? std::clamp(loadedStartSlot + playbackFrame, 0, targetFrames - 1)
+        : targetFrames - 1;
+    const int renderPending = std::max(0, app.liveLoopBackfillPendingFrames());
+    const int fetchTotal = std::max(0, app.liveLoopBackfillFetchTotal());
+    const int fetchDone = std::max(0, app.liveLoopBackfillFetchCompleted());
+    const int downloadOutstanding = std::max(0, fetchTotal - fetchDone);
+
+    const float width = std::max(240.0f, ImGui::GetContentRegionAvail().x);
+    ImGui::InvisibleButton(id, ImVec2(width, height));
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    const ImU32 bg = IM_COL32(18, 22, 30, 230);
+    const ImU32 border = IM_COL32(70, 78, 92, 255);
+    const ImU32 missing = IM_COL32(46, 52, 62, 255);
+    const ImU32 downloading = IM_COL32(72, 92, 132, 255);
+    const ImU32 rendering = IM_COL32(114, 95, 42, 255);
+    const ImU32 ready = IM_COL32(52, 170, 108, 255);
+    const ImU32 current = IM_COL32(255, 214, 96, 255);
+    const ImU32 liveEdge = IM_COL32(78, 220, 136, 255);
+
+    draw->AddRectFilled(min, max, bg, 6.0f);
+    draw->AddRect(min, max, border, 6.0f, 0, 1.0f);
+
+    const float innerPad = 4.0f;
+    const float trackMinX = min.x + innerPad;
+    const float trackMaxX = max.x - innerPad;
+    const float trackMinY = min.y + innerPad;
+    const float trackMaxY = max.y - innerPad;
+    const float slotWidth = (trackMaxX - trackMinX) / (float)targetFrames;
+
+    const int renderStartSlot = std::max(0, loadedStartSlot - std::min(renderPending, loadedStartSlot));
+    const int downloadStartSlot = std::max(0, renderStartSlot - std::min(downloadOutstanding, renderStartSlot));
+
+    for (int slot = 0; slot < targetFrames; ++slot) {
+        ImU32 color = missing;
+        if (slot >= loadedStartSlot) {
+            color = ready;
+        } else if (slot >= renderStartSlot) {
+            color = rendering;
+        } else if (slot >= downloadStartSlot) {
+            color = downloading;
+        }
+
+        const float x0 = trackMinX + slotWidth * slot;
+        const float x1 = (slot == targetFrames - 1) ? trackMaxX : (trackMinX + slotWidth * (slot + 1));
+        const float pad = slotWidth > 3.0f ? 0.75f : 0.0f;
+        draw->AddRectFilled(ImVec2(x0 + pad, trackMinY), ImVec2(x1 - pad, trackMaxY), color, 2.5f);
+    }
+
+    const float currentX = trackMinX + slotWidth * (float)currentSlot;
+    const float currentW = std::max(2.0f, slotWidth);
+    draw->AddRectFilled(ImVec2(currentX, min.y + 1.5f),
+                        ImVec2(std::min(trackMaxX, currentX + currentW), max.y - 1.5f),
+                        current, 3.0f);
+
+    const float liveX = trackMaxX - 1.5f;
+    draw->AddLine(ImVec2(liveX, min.y + 3.0f), ImVec2(liveX, max.y - 3.0f), liveEdge, 2.0f);
+    draw->AddText(ImVec2(std::max(trackMinX, trackMaxX - 28.0f), min.y - 16.0f), liveEdge, "LIVE");
+
+    auto slotFromMouse = [&](float mouseX) {
+        const float normalized = std::clamp((mouseX - trackMinX) / std::max(1.0f, trackMaxX - trackMinX), 0.0f, 0.999999f);
+        return std::clamp((int)std::floor(normalized * targetFrames), 0, targetFrames - 1);
+    };
+
+    if (ImGui::IsItemHovered()) {
+        const int hoveredSlot = slotFromMouse(ImGui::GetIO().MousePos.x);
+        ImGui::BeginTooltip();
+        ImGui::Text("Frame Slot %d / %d", hoveredSlot + 1, targetFrames);
+        if (hoveredSlot >= loadedStartSlot && availableFrames > 0) {
+            const int frameIndex = hoveredSlot - loadedStartSlot;
+            const std::string label = app.liveLoopLabelAtFrame(frameIndex);
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "Ready");
+            if (!label.empty())
+                ImGui::TextWrapped("%s", label.c_str());
+        } else if (hoveredSlot >= renderStartSlot) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "Queued for render");
+        } else if (hoveredSlot >= downloadStartSlot) {
+            ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "Downloading source scan");
+        } else {
+            ImGui::TextDisabled("Not loaded yet");
+        }
+        ImGui::EndTooltip();
+    }
+
+    if ((ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) ||
+        (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))) {
+        if (availableFrames > 0) {
+            const int slot = slotFromMouse(ImGui::GetIO().MousePos.x);
+            const int frameIndex = (slot < loadedStartSlot)
+                ? 0
+                : std::clamp(slot - loadedStartSlot, 0, availableFrames - 1);
+            app.setLiveLoopPlaybackFrame(frameIndex);
+        }
+    }
+}
+
+void drawLiveLoopBar(App& app) {
+    if (app.m_historicMode || app.snapshotMode() || !app.liveLoopEnabled())
+        return;
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float width = std::max(460.0f, vp->Size.x - 36.0f);
+    const float height = 92.0f;
+    const ImVec2 pos(vp->Pos.x + 18.0f, vp->Pos.y + vp->Size.y - height - 14.0f);
+
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoDocking |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoScrollbar;
+    ImGui::Begin("Live Loop Bar", nullptr, flags);
+
+    const int available = app.liveLoopAvailableFrames();
+    const int requested = app.liveLoopLength();
+    const int pending = app.liveLoopBackfillPendingFrames();
+    const int fetchTotal = app.liveLoopBackfillFetchTotal();
+    const int fetchDone = app.liveLoopBackfillFetchCompleted();
+    const bool loading = app.liveLoopBackfillLoading() || pending > 0;
+    const std::string currentLabel = app.liveLoopCurrentLabel();
+
+    if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play", ImVec2(62, 24)))
+        app.toggleLiveLoopPlayback();
+    ImGui::SameLine();
+    if (ImGui::Button("Live", ImVec2(56, 24)))
+        app.setLiveLoopPlaybackFrame(available > 0 ? available - 1 : 0);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear", ImVec2(56, 24)))
+        app.clearLiveLoop();
+    ImGui::SameLine();
+    if (ImGui::Button("Options", ImVec2(72, 24)))
+        ImGui::OpenPopup("LiveLoopOptions");
+
+    if (ImGui::BeginPopup("LiveLoopOptions")) {
+        int loopFrames = app.liveLoopLength();
+        if (ImGui::SliderInt("Loop Frames", &loopFrames, 1, app.liveLoopMaxFrames()))
+            app.setLiveLoopLength(loopFrames);
+        float loopSpeed = app.liveLoopSpeed();
+        if (ImGui::SliderFloat("Loop FPS", &loopSpeed, 1.0f, 15.0f, "%.0f fps"))
+            app.setLiveLoopSpeed(loopSpeed);
+        if (app.mode3D() || app.crossSection())
+            ImGui::TextDisabled("Realtime loop playback is 2D-only.");
+        ImGui::EndPopup();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), width - 360.0f));
+    if (!currentLabel.empty())
+        ImGui::Text("%s", currentLabel.c_str());
+    else if (loading)
+        ImGui::TextDisabled("Loading live loop...");
+    else
+        ImGui::TextDisabled("Waiting for live frames...");
+
+    drawLiveLoopTimeline(app, "##live_loop_timeline_bar", 28.0f);
+
+    const float fps = app.liveLoopSpeed();
+    ImGui::Text("Ready %d / %d", available, requested);
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    ImGui::Text("Playback %.0f fps", fps);
+    if (fetchTotal > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text("Downloads %d / %d", fetchDone, fetchTotal);
+    }
+    if (pending > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text("Rendering %d", pending);
+    }
+    if (!loading && available <= 0)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::TextDisabled("No frames cached yet");
+    }
+
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) ||
+        (ImGui::IsAnyItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
+        g_uiWantsMouseCapture = true;
+    }
+
+    ImGui::End();
 }
 
 void centerOnWarning(App& app, const WarningPolygon& warning) {
@@ -483,6 +687,7 @@ void init() {
 }
 
 void render(App& app) {
+    g_uiWantsMouseCapture = false;
     auto& vp = app.viewport();
     ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const auto stations = app.stations();
@@ -888,39 +1093,18 @@ void render(App& app) {
 
     ImGui::Separator();
 
-    if (!app.m_historicMode && !app.snapshotMode() &&
-        ImGui::CollapsingHeader("Live Loop", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!app.m_historicMode && !app.snapshotMode()) {
         bool liveLoopEnabled = app.liveLoopEnabled();
-        if (ImGui::Checkbox("Enable Realtime Loop", &liveLoopEnabled))
+        if (ImGui::Checkbox("Realtime Loop", &liveLoopEnabled))
             app.setLiveLoopEnabled(liveLoopEnabled);
-
-        ImGui::BeginDisabled(!liveLoopEnabled);
-        int loopFrames = app.liveLoopLength();
-        if (ImGui::SliderInt("Loop Frames", &loopFrames, 1, app.liveLoopMaxFrames()))
-            app.setLiveLoopLength(loopFrames);
-
-        float loopSpeed = app.liveLoopSpeed();
-        if (ImGui::SliderFloat("Loop FPS", &loopSpeed, 1.0f, 15.0f, "%.0f fps"))
-            app.setLiveLoopSpeed(loopSpeed);
-
-        if (ImGui::Button(app.liveLoopPlaying() ? "Pause Loop" : "Play Loop", ImVec2(102, 24)))
-            app.toggleLiveLoopPlayback();
-        ImGui::SameLine();
-        if (ImGui::Button("Jump Live", ImVec2(102, 24)))
-            app.setLiveLoopPlaybackFrame(app.liveLoopAvailableFrames() > 0
-                ? app.liveLoopAvailableFrames() - 1
-                : 0);
-
-        ImGui::Text("Cached Frames: %d / %d",
-                    app.liveLoopAvailableFrames(), app.liveLoopLength());
-        std::string liveLoopLabel = app.liveLoopCurrentLabel();
-        if (!liveLoopLabel.empty())
-            ImGui::TextWrapped("%s", liveLoopLabel.c_str());
-        if (app.mode3D() || app.crossSection())
-            ImGui::TextDisabled("Realtime loop playback is 2D-only.");
-        if (ImGui::Button("Clear Loop", ImVec2(210, 24)))
-            app.clearLiveLoop();
-        ImGui::EndDisabled();
+        if (liveLoopEnabled) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d/%d frames", app.liveLoopAvailableFrames(), app.liveLoopLength());
+            if (app.mode3D() || app.crossSection())
+                ImGui::TextDisabled("Bottom transport bar is 2D-only.");
+            else
+                ImGui::TextDisabled("Transport bar active at bottom.");
+        }
         ImGui::Separator();
     }
 
@@ -1149,36 +1333,7 @@ void render(App& app) {
         ImGui::End();
     }
 
-    if (!app.m_historicMode && !app.snapshotMode() && app.liveLoopEnabled()) {
-        ImGui::SetNextWindowSize(ImVec2(560, 150), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
-        ImGui::Begin("Realtime Loop");
-
-        if (app.liveLoopAvailableFrames() <= 0) {
-            ImGui::TextDisabled("Waiting for live frames...");
-        } else {
-            std::string liveLoopLabel = app.liveLoopCurrentLabel();
-            ImGui::Text("%s", liveLoopLabel.empty() ? "Realtime Loop" : liveLoopLabel.c_str());
-
-            if (ImGui::Button(app.liveLoopPlaying() ? "Pause" : "Play", ImVec2(60, 20)))
-                app.toggleLiveLoopPlayback();
-            ImGui::SameLine();
-            if (ImGui::Button("Live", ImVec2(60, 20)))
-                app.setLiveLoopPlaybackFrame(app.liveLoopAvailableFrames() - 1);
-            ImGui::SameLine();
-            float loopSpeed = app.liveLoopSpeed();
-            ImGui::SetNextItemWidth(90);
-            if (ImGui::SliderFloat("##live_loop_spd", &loopSpeed, 1.0f, 15.0f, "%.0f fps"))
-                app.setLiveLoopSpeed(loopSpeed);
-
-            int liveFrame = app.liveLoopPlaybackFrame();
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::SliderInt("##live_loop_frame", &liveFrame, 0, app.liveLoopAvailableFrames() - 1))
-                app.setLiveLoopPlaybackFrame(liveFrame);
-        }
-
-        ImGui::End();
-    }
+    drawLiveLoopBar(app);
 
     // ── Station list (right panel, hide in historic mode) ──
     if (app.m_historicMode) goto skip_station_list;
@@ -1644,6 +1799,10 @@ void render(App& app) {
 }
 
 void shutdown() {
+}
+
+bool wantsMouseCapture() {
+    return g_uiWantsMouseCapture;
 }
 
 } // namespace ui

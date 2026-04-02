@@ -183,13 +183,15 @@ int main(int argc, char** argv) {
         double mx, my;
         glfwGetCursorPos(window, &mx, &my);
 
+        const bool uiCapturingMouse = ImGui::GetIO().WantCaptureMouse || ui::wantsMouseCapture();
+
         // Station tracking (lock station in cross-section/3D mode)
-        if (!ImGui::GetIO().WantCaptureMouse && !app.crossSection() && !app.mode3D()) {
+        if (!uiCapturingMouse && !app.crossSection() && !app.mode3D()) {
             app.onMouseMove(mx, my);
         }
 
         // Left drag to pan, right drag to orbit (3D mode)
-        if (!ImGui::GetIO().WantCaptureMouse) {
+        if (!uiCapturingMouse) {
             if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
                 if (g_mouseDown)
                     app.onMouseDrag(mx - g_lastMouseX, my - g_lastMouseY);

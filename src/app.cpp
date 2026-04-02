@@ -1336,9 +1336,12 @@ void App::setRadarPanelLayout(RadarPanelLayout layout) {
         return;
     m_radarPanelLayout = layout;
     invalidatePanelCaches();
-    invalidateFrameCache(true);
-    invalidateLiveLoop(true);
     ensureRenderTargets();
+    resetHistoricFrameCache(true);
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll &&
+        !m_mode3D && !m_crossSection) {
+        requestLiveLoopBackfill();
+    }
     m_needsRerender = true;
     updateMemoryTelemetry(true);
 }
@@ -1354,7 +1357,7 @@ void App::setRadarPanelProduct(int index, int product) {
         return;
     m_radarPanels[index].product = product;
     m_panelCacheStates[index].valid = false;
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
     m_needsRerender = true;
 }
 
@@ -1372,7 +1375,11 @@ void App::setRadarCanvasRect(int x, int y, int width, int height) {
     m_radarCanvasWidth = width;
     m_radarCanvasHeight = height;
     ensureRenderTargets();
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll &&
+        !m_mode3D && !m_crossSection) {
+        requestLiveLoopBackfill();
+    }
     m_needsRerender = true;
 }
 
@@ -1435,6 +1442,7 @@ int App::stationLiveHistoryLimitLocked(int stationIdx) const {
     int activeLimit = std::max(MAX_LIVE_LOOP_FRAMES, 30);
     int visibleLimit = 8;
     int backgroundLimit = 4;
+    const int requestedLoopDepth = std::max(1, std::min(m_liveLoopLength, MAX_LIVE_LOOP_FRAMES));
     switch (m_effectivePerformanceProfile) {
         case PerformanceProfile::Performance:
             activeLimit = std::max(MAX_LIVE_LOOP_FRAMES / 2, 16);
@@ -1455,9 +1463,9 @@ int App::stationLiveHistoryLimitLocked(int stationIdx) const {
     if (m_snapshotMode || m_historicMode)
         return 0;
     if (stationIdx == m_activeStationIdx)
-        return activeLimit;
+        return std::max(activeLimit, requestedLoopDepth);
     if (stationLikelyVisible(stationIdx))
-        return visibleLimit;
+        return std::max(visibleLimit, requestedLoopDepth);
     return backgroundLimit;
 }
 
@@ -2087,10 +2095,15 @@ void App::requestProbSevereRefresh(bool force) {
 void App::invalidateLiveLoop(bool freeMemory) {
     m_liveLoopBackfillGeneration.fetch_add(1);
     m_liveLoopBackfillLoading = false;
+    m_liveLoopBackfillDeferFrames = 0;
+    m_liveLoopInteractiveBackfill = false;
     {
         std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
         m_liveLoopBackfillQueue.clear();
     }
+    m_liveLoopBackfillQueueCount = 0;
+    m_liveLoopBackfillFetchTotal = 0;
+    m_liveLoopBackfillFetchCompleted = 0;
     m_liveLoopBackfillReplaceExisting = false;
     resetLiveLoopFrameCache(freeMemory);
 }
@@ -2109,6 +2122,8 @@ void App::resetLiveLoopFrameCache(bool freeMemory) {
 
     for (auto& label : m_liveLoopLabels)
         label.clear();
+    for (auto& key : m_liveLoopVolumeKeys)
+        key.clear();
 
     m_liveLoopPlaying = false;
     m_liveLoopCount = 0;
@@ -2125,7 +2140,107 @@ void App::requestLiveLoopCapture() {
     m_liveLoopCapturePending = true;
 }
 
+void App::scheduleInteractiveLiveLoopBackfill() {
+    if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection || m_showAll)
+        return;
+
+    const bool keepPlaying = m_liveLoopPlaying;
+
+    // Interactive view/product/tilt changes should only reset the rendered loop
+    // view, not cancel in-flight source downloads/history growth.
+    resetLiveLoopFrameCache(false);
+    {
+        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+        m_liveLoopBackfillQueue.clear();
+        m_liveLoopBackfillQueueCount = 0;
+        m_liveLoopBackfillReplaceExisting = false;
+    }
+    m_liveLoopBackfillDeferFrames = std::max(m_liveLoopBackfillDeferFrames, 1);
+    m_liveLoopInteractiveBackfill = true;
+    m_liveLoopPlaying = keepPlaying;
+    requestLiveLoopCapture();
+    if (m_liveLoopBackfillLoading.load())
+        m_liveLoopLocalRefreshPending = true;
+    else
+        requestLiveLoopBackfillForViewRefresh();
+}
+
 void App::requestLiveLoopBackfill() {
+    requestLiveLoopBackfillImpl(true);
+}
+
+void App::requestLiveLoopBackfillForViewRefresh() {
+    if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection) {
+        requestLiveLoopCapture();
+        return;
+    }
+    if (m_showAll || m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) {
+        requestLiveLoopCapture();
+        return;
+    }
+
+    const int desiredFrames = std::max(1, std::min(m_liveLoopLength, MAX_LIVE_LOOP_FRAMES));
+    queueLiveLoopFramesFromHistory(m_activeStationIdx, desiredFrames, true);
+}
+
+void App::queueLiveLoopFramesFromHistory(int stationIdx, int desiredFrames, bool replaceExisting) {
+    if (stationIdx < 0 || stationIdx >= (int)m_stations.size())
+        return;
+
+    float fallbackLat = 0.0f;
+    float fallbackLon = 0.0f;
+    std::vector<LiveLoopBackfillFrame> localFrames;
+    const int requestProduct = m_activeProduct;
+    const int requestTilt = m_activeTilt;
+    const bool requestSrvMode = m_srvMode && requestProduct == PROD_VEL;
+    const float requestStormSpeed = m_stormSpeed;
+    const float requestStormDir = m_stormDir;
+    const float requestDbzThreshold = m_dbzMinThreshold;
+    const float requestVelocityThreshold = m_velocityMinThreshold;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        const auto& st = m_stations[stationIdx];
+        fallbackLat = (st.data_lat != 0.0f) ? st.data_lat : st.lat;
+        fallbackLon = (st.data_lon != 0.0f) ? st.data_lon : st.lon;
+        const int historyStart = std::max(0, (int)st.live_history.size() - desiredFrames);
+        localFrames.reserve((int)st.live_history.size() - historyStart);
+        for (int i = historyStart; i < (int)st.live_history.size(); i++) {
+            const auto& entry = st.live_history[i];
+            if (entry.sweeps.empty())
+                continue;
+            LiveLoopBackfillFrame frame;
+            frame.volume_key = entry.volume_key;
+            frame.label = entry.label.empty() ? formatVolumeKeyTimestamp(entry.volume_key) : entry.label;
+            frame.sweeps = entry.sweeps;
+            frame.station_lat = entry.station_lat != 0.0f ? entry.station_lat : fallbackLat;
+            frame.station_lon = entry.station_lon != 0.0f ? entry.station_lon : fallbackLon;
+            frame.product = requestProduct;
+            frame.tilt = requestTilt;
+            frame.srv_mode = requestSrvMode;
+            frame.storm_speed = requestStormSpeed;
+            frame.storm_dir = requestStormDir;
+            frame.dbz_threshold = requestDbzThreshold;
+            frame.velocity_threshold = requestVelocityThreshold;
+            localFrames.push_back(std::move(frame));
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+        m_liveLoopBackfillQueue.clear();
+        for (auto& frame : localFrames)
+            m_liveLoopBackfillQueue.push_back(std::move(frame));
+        m_liveLoopBackfillReplaceExisting = replaceExisting && !m_liveLoopBackfillQueue.empty();
+        m_liveLoopBackfillQueueCount = (int)m_liveLoopBackfillQueue.size();
+    }
+
+    if (localFrames.empty()) {
+        resetLiveLoopFrameCache(false);
+        requestLiveLoopCapture();
+    }
+}
+
+void App::requestLiveLoopBackfillImpl(bool allowDownload) {
     if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection) {
         requestLiveLoopCapture();
         return;
@@ -2141,8 +2256,14 @@ void App::requestLiveLoopBackfill() {
     std::string currentKey;
     float fallbackLat = 0.0f;
     float fallbackLon = 0.0f;
-    std::vector<LiveLoopBackfillFrame> localFrames;
     const bool dealiasEnabled = m_dealias;
+    const int requestProduct = m_activeProduct;
+    const int requestTilt = m_activeTilt;
+    const bool requestSrvMode = m_srvMode && requestProduct == PROD_VEL;
+    const float requestStormSpeed = m_stormSpeed;
+    const float requestStormDir = m_stormDir;
+    const float requestDbzThreshold = m_dbzMinThreshold;
+    const float requestVelocityThreshold = m_velocityMinThreshold;
     {
         std::lock_guard<std::mutex> lock(m_stationMutex);
         const auto& st = m_stations[requestStationIdx];
@@ -2150,19 +2271,8 @@ void App::requestLiveLoopBackfill() {
         currentKey = st.latestVolumeKey;
         fallbackLat = (st.data_lat != 0.0f) ? st.data_lat : st.lat;
         fallbackLon = (st.data_lon != 0.0f) ? st.data_lon : st.lon;
-        const int historyStart = std::max(0, (int)st.live_history.size() - desiredFrames);
-        localFrames.reserve((int)st.live_history.size() - historyStart);
-        for (int i = historyStart; i < (int)st.live_history.size(); i++) {
-            const auto& entry = st.live_history[i];
-            if (entry.sweeps.empty())
-                continue;
-            LiveLoopBackfillFrame frame;
-            frame.label = entry.label.empty() ? formatVolumeKeyTimestamp(entry.volume_key) : entry.label;
-            frame.sweeps = entry.sweeps;
-            frame.station_lat = entry.station_lat != 0.0f ? entry.station_lat : fallbackLat;
-            frame.station_lon = entry.station_lon != 0.0f ? entry.station_lon : fallbackLon;
-            localFrames.push_back(std::move(frame));
-        }
+        if (currentKey.empty() && !st.live_history.empty())
+            currentKey = st.live_history.back().volume_key;
     }
     if (stationCode.empty()) {
         requestLiveLoopCapture();
@@ -2170,19 +2280,19 @@ void App::requestLiveLoopBackfill() {
     }
 
     const uint64_t generation = m_liveLoopBackfillGeneration.fetch_add(1) + 1;
+    m_liveLoopBackfillFetchTotal = 0;
+    m_liveLoopBackfillFetchCompleted = 0;
+    m_liveLoopLocalRefreshPending = false;
+    queueLiveLoopFramesFromHistory(requestStationIdx, desiredFrames, true);
+
+    int localCount = 0;
     {
-        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
-        m_liveLoopBackfillQueue.clear();
-        for (auto& frame : localFrames)
-            m_liveLoopBackfillQueue.push_back(std::move(frame));
-        m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
-    }
-    if (localFrames.empty()) {
-        resetLiveLoopFrameCache(false);
-        requestLiveLoopCapture();
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (requestStationIdx >= 0 && requestStationIdx < (int)m_stations.size())
+            localCount = std::min(desiredFrames, (int)m_stations[requestStationIdx].live_history.size());
     }
 
-    if ((int)localFrames.size() >= desiredFrames || currentKey.empty()) {
+    if (localCount >= desiredFrames || currentKey.empty() || !allowDownload) {
         m_liveLoopBackfillLoading = false;
         return;
     }
@@ -2200,7 +2310,9 @@ void App::requestLiveLoopBackfill() {
         radarDataHost(stationInfo),
         listQuery,
         [this, generation, stationCode, currentKey, desiredFrames, dealiasEnabled,
-         fallbackLat, fallbackLon, year, month, day, requestStationIdx](const std::string& id, DownloadResult listResult) {
+         fallbackLat, fallbackLon, year, month, day, requestStationIdx,
+         requestProduct, requestTilt, requestSrvMode, requestStormSpeed, requestStormDir,
+         requestDbzThreshold, requestVelocityThreshold](const std::string& id, DownloadResult listResult) {
             (void)id;
             if (generation != m_liveLoopBackfillGeneration.load())
                 return;
@@ -2265,40 +2377,16 @@ void App::requestLiveLoopBackfill() {
                 }
             }
 
-            struct OrderedLoopFrame {
-                std::string key;
-                LiveLoopBackfillFrame frame;
-            };
-            std::vector<OrderedLoopFrame> orderedFrames;
-            orderedFrames.reserve(desiredFrames);
+            std::unordered_set<std::string> existingKeys;
             {
                 std::lock_guard<std::mutex> stationLock(m_stationMutex);
                 if (requestStationIdx >= 0 && requestStationIdx < (int)m_stations.size()) {
                     const auto& st = m_stations[requestStationIdx];
-                    const int historyStart = std::max(0, (int)st.live_history.size() - desiredFrames);
-                    for (int i = historyStart; i < (int)st.live_history.size(); i++) {
-                        const auto& entry = st.live_history[i];
-                        if (entry.sweeps.empty())
-                            continue;
-                        OrderedLoopFrame ordered;
-                        ordered.key = entry.volume_key;
-                        ordered.frame.label = entry.label.empty()
-                            ? formatVolumeKeyTimestamp(entry.volume_key)
-                            : entry.label;
-                        ordered.frame.sweeps = entry.sweeps;
-                        ordered.frame.station_lat =
-                            entry.station_lat != 0.0f ? entry.station_lat : fallbackLat;
-                        ordered.frame.station_lon =
-                            entry.station_lon != 0.0f ? entry.station_lon : fallbackLon;
-                        orderedFrames.push_back(std::move(ordered));
-                    }
+                    existingKeys.reserve(st.live_history.size() + selectedKeys.size());
+                    for (const auto& entry : st.live_history)
+                        existingKeys.insert(entry.volume_key);
                 }
             }
-
-            std::unordered_set<std::string> existingKeys;
-            existingKeys.reserve(orderedFrames.size() + selectedKeys.size());
-            for (const auto& existing : orderedFrames)
-                existingKeys.insert(existing.key);
 
             std::vector<std::string> keysToFetch;
             keysToFetch.reserve(selectedKeys.size());
@@ -2308,88 +2396,93 @@ void App::requestLiveLoopBackfill() {
             }
 
             if (!keysToFetch.empty()) {
-                std::mutex orderedFramesMutex;
+                m_liveLoopBackfillFetchTotal = (int)keysToFetch.size();
+                m_liveLoopBackfillFetchCompleted = 0;
                 auto backfillDownloader = std::make_shared<Downloader>(std::min<int>(8, (int)keysToFetch.size()));
-                for (const auto& key : keysToFetch) {
+                auto remaining = std::make_shared<std::atomic<int>>((int)keysToFetch.size());
+                std::thread([keepAlive = backfillDownloader]() {
+                    keepAlive->waitAll();
+                }).detach();
+                for (auto it = keysToFetch.rbegin(); it != keysToFetch.rend(); ++it) {
+                    const std::string key = *it;
                     backfillDownloader->queueDownload(
                         key, siteHost, buildRadarDownloadRequest(site, key),
-                        [this, &orderedFrames, &orderedFramesMutex, generation,
-                         dealiasEnabled, fallbackLat, fallbackLon](const std::string& id, DownloadResult result) {
-                            if (generation != m_liveLoopBackfillGeneration.load())
+                        [this, remaining, generation, requestStationIdx, desiredFrames,
+                         dealiasEnabled, fallbackLat, fallbackLon,
+                         requestProduct, requestTilt, requestSrvMode, requestStormSpeed, requestStormDir,
+                         requestDbzThreshold, requestVelocityThreshold](const std::string& id, DownloadResult result) {
+                            auto finishOne = [&]() {
+                                m_liveLoopBackfillFetchCompleted.fetch_add(1);
+                                const int left = remaining->fetch_sub(1) - 1;
+                                if (left <= 0) {
+                                    if (generation == m_liveLoopBackfillGeneration.load()) {
+                                        m_liveLoopBackfillLoading = false;
+                                        m_liveLoopLocalRefreshPending = true;
+                                    }
+                                }
+                            };
+
+                            if (generation != m_liveLoopBackfillGeneration.load()) {
+                                finishOne();
                                 return;
-                            if (!result.success || result.data.empty())
+                            }
+                            if (!result.success || result.data.empty()) {
+                                finishOne();
                                 return;
+                            }
 
                             auto parsed = Level2Parser::parse(result.data);
-                            if (parsed.sweeps.empty())
+                            if (parsed.sweeps.empty()) {
+                                finishOne();
                                 return;
+                            }
 
                             LiveLoopBackfillFrame frame;
+                            frame.volume_key = id;
                             frame.label = formatVolumeKeyTimestamp(id);
                             frame.sweeps = buildPrecomputedSweeps(parsed);
                             if (dealiasEnabled)
                                 dealiasPrecomputedSweeps(frame.sweeps);
                             frame.station_lat = (parsed.station_lat != 0.0f) ? parsed.station_lat : fallbackLat;
                             frame.station_lon = (parsed.station_lon != 0.0f) ? parsed.station_lon : fallbackLon;
+                            frame.product = requestProduct;
+                            frame.tilt = requestTilt;
+                            frame.srv_mode = requestSrvMode;
+                            frame.storm_speed = requestStormSpeed;
+                            frame.storm_dir = requestStormDir;
+                            frame.dbz_threshold = requestDbzThreshold;
+                            frame.velocity_threshold = requestVelocityThreshold;
 
-                            if (frame.sweeps.empty())
+                            if (frame.sweeps.empty()) {
+                                finishOne();
                                 return;
+                            }
 
-                            OrderedLoopFrame ordered;
-                            ordered.key = id;
-                            ordered.frame = std::move(frame);
-                            std::lock_guard<std::mutex> lock(orderedFramesMutex);
-                            orderedFrames.push_back(std::move(ordered));
+                            {
+                                std::lock_guard<std::mutex> stationLock(m_stationMutex);
+                                if (generation == m_liveLoopBackfillGeneration.load() &&
+                                    requestStationIdx >= 0 &&
+                                    requestStationIdx < (int)m_stations.size()) {
+                                    auto& st = m_stations[requestStationIdx];
+                                    if (st.enabled) {
+                                        appendLiveHistoryLocked(st, id,
+                                                                frame.sweeps,
+                                                                frame.station_lat,
+                                                                frame.station_lon);
+                                    }
+                                }
+                            }
+                            trimLiveHistoryWorkingSet(requestStationIdx);
+                            if (generation == m_liveLoopBackfillGeneration.load())
+                                m_liveLoopLocalRefreshPending = true;
+                            finishOne();
                         });
                 }
-
-                backfillDownloader->waitAll();
-                if (generation != m_liveLoopBackfillGeneration.load()) {
-                    m_liveLoopBackfillLoading = false;
-                    return;
-                }
-            }
-
-            std::sort(orderedFrames.begin(), orderedFrames.end(),
-                      [](const OrderedLoopFrame& a, const OrderedLoopFrame& b) {
-                          return a.key < b.key;
-                      });
-            orderedFrames.erase(
-                std::unique(orderedFrames.begin(), orderedFrames.end(),
-                            [](const OrderedLoopFrame& a, const OrderedLoopFrame& b) {
-                                return a.key == b.key;
-                            }),
-                orderedFrames.end());
-            if ((int)orderedFrames.size() > desiredFrames) {
-                orderedFrames.erase(orderedFrames.begin(),
-                                    orderedFrames.end() - desiredFrames);
-            }
-
-            {
-                std::lock_guard<std::mutex> stationLock(m_stationMutex);
-                if (requestStationIdx >= 0 && requestStationIdx < (int)m_stations.size()) {
-                    auto& st = m_stations[requestStationIdx];
-                    if (st.enabled) {
-                        for (const auto& ordered : orderedFrames) {
-                            appendLiveHistoryLocked(st,
-                                                    ordered.key,
-                                                    ordered.frame.sweeps,
-                                                    ordered.frame.station_lat,
-                                                    ordered.frame.station_lon);
-                        }
-                    }
-                }
-            }
-            trimLiveHistoryWorkingSet(requestStationIdx);
-
-            if (generation == m_liveLoopBackfillGeneration.load()) {
-                std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
-                m_liveLoopBackfillQueue.clear();
-                for (auto& ordered : orderedFrames)
-                    m_liveLoopBackfillQueue.push_back(std::move(ordered.frame));
-                m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
+            } else {
                 m_liveLoopBackfillLoading = false;
-                if (orderedFrames.empty())
+                if (generation == m_liveLoopBackfillGeneration.load())
+                    m_liveLoopLocalRefreshPending = true;
+                if (selectedKeys.empty())
                     requestLiveLoopCapture();
             }
         });
@@ -2420,13 +2513,15 @@ std::string App::currentLiveLoopCaptureLabel() const {
     return "Live";
 }
 
-void App::captureLiveLoopFrame(const uint32_t* d_src, int w, int h, const std::string& label) {
+void App::captureLiveLoopFrame(const uint32_t* d_src, int w, int h,
+                               const std::string& label,
+                               const std::string& volumeKey) {
     if (!m_liveLoopEnabled || m_liveLoopLength <= 0 || !d_src || w <= 0 || h <= 0)
         return;
 
     if ((m_liveLoopFrameWidth > 0 || m_liveLoopFrameHeight > 0) &&
         (m_liveLoopFrameWidth != w || m_liveLoopFrameHeight != h)) {
-        invalidateLiveLoop(true);
+        resetLiveLoopFrameCache(true);
     }
 
     m_liveLoopFrameWidth = w;
@@ -2438,6 +2533,7 @@ void App::captureLiveLoopFrame(const uint32_t* d_src, int w, int h, const std::s
         CUDA_CHECK(cudaMalloc(&m_liveLoopFrames[slot], sz));
     CUDA_CHECK(cudaMemcpy(m_liveLoopFrames[slot], d_src, sz, cudaMemcpyDeviceToDevice));
     m_liveLoopLabels[slot] = label;
+    m_liveLoopVolumeKeys[slot] = volumeKey;
 
     if (m_liveLoopCount < m_liveLoopLength)
         m_liveLoopCount++;
@@ -2464,10 +2560,24 @@ void App::processLiveLoopBackfill() {
     if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection)
         return;
 
-    constexpr int kMaxFramesPerPass = 8;
+    if (m_liveLoopBackfillDeferFrames > 0) {
+        --m_liveLoopBackfillDeferFrames;
+        return;
+    }
+
+    const int kMaxFramesPerPass = m_liveLoopInteractiveBackfill
+        ? 2
+        : std::max(4, std::min(16, std::max(4, m_liveLoopLength / 12)));
+    const float timeBudgetMs = m_liveLoopInteractiveBackfill
+        ? 2.0f
+        : ((m_liveLoopCount <= 1) ? 8.0f : 4.0f);
+    const auto passStart = Clock::now();
     bool processedAny = false;
 
     for (int processed = 0; processed < kMaxFramesPerPass; ++processed) {
+        if (processed > 0 && elapsedMs(passStart, Clock::now()) >= timeBudgetMs)
+            break;
+
         LiveLoopBackfillFrame frame;
         bool haveFrame = false;
         bool replaceExisting = false;
@@ -2480,6 +2590,7 @@ void App::processLiveLoopBackfill() {
             if (!m_liveLoopBackfillQueue.empty()) {
                 frame = std::move(m_liveLoopBackfillQueue.front());
                 m_liveLoopBackfillQueue.pop_front();
+                m_liveLoopBackfillQueueCount = (int)m_liveLoopBackfillQueue.size();
                 haveFrame = true;
             }
         }
@@ -2490,12 +2601,12 @@ void App::processLiveLoopBackfill() {
         if (replaceExisting)
             resetLiveLoopFrameCache(false);
 
-        const int productTilts = countProductSweeps(frame.sweeps, m_activeProduct);
+        const int productTilts = countProductSweeps(frame.sweeps, frame.product);
         if (productTilts <= 0)
             continue;
 
-        const int sweepIdx = findProductSweep(frame.sweeps, m_activeProduct,
-                                              std::min(m_activeTilt, productTilts - 1));
+        const int sweepIdx = findProductSweep(frame.sweeps, frame.product,
+                                              std::min(frame.tilt, productTilts - 1));
         if (sweepIdx < 0 || sweepIdx >= (int)frame.sweeps.size())
             continue;
 
@@ -2527,7 +2638,6 @@ void App::processLiveLoopBackfill() {
 
         gpu::allocateStation(kLiveLoopBackfillSlot, info);
         gpu::uploadStationData(kLiveLoopBackfillSlot, info, pc.azimuths.data(), gatePtrs);
-        gpu::syncStation(kLiveLoopBackfillSlot);
 
         const int rw = renderWidth();
         const int rh = renderHeight();
@@ -2541,20 +2651,29 @@ void App::processLiveLoopBackfill() {
         gpuVp.width = rw;
         gpuVp.height = rh;
 
-        const float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
-        const float activeThreshold = (m_activeProduct == PROD_VEL)
-            ? m_velocityMinThreshold
-            : m_dbzMinThreshold;
+        const float srvSpd = (frame.srv_mode && frame.product == PROD_VEL) ? frame.storm_speed : 0.0f;
+        const float activeThreshold = (frame.product == PROD_VEL)
+            ? frame.velocity_threshold
+            : frame.dbz_threshold;
         gpu::forwardRenderStation(gpuVp, kLiveLoopBackfillSlot,
-                                  m_activeProduct, activeThreshold,
-                                  m_d_compositeOutput, srvSpd, m_stormDir);
-        captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height, frame.label);
+                                  frame.product, activeThreshold,
+                                  m_d_compositeOutput, srvSpd, frame.storm_dir);
+        captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height,
+                             frame.label, frame.volume_key);
         gpu::freeStation(kLiveLoopBackfillSlot);
         processedAny = true;
     }
 
     if (!processedAny && !m_liveLoopBackfillLoading && m_liveLoopCount == 0)
         requestLiveLoopCapture();
+
+    bool queueEmpty = false;
+    {
+        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+        queueEmpty = m_liveLoopBackfillQueue.empty();
+    }
+    if (queueEmpty && !m_liveLoopBackfillLoading)
+        m_liveLoopInteractiveBackfill = false;
 }
 
 void App::setLiveLoopEnabled(bool enabled) {
@@ -2628,6 +2747,24 @@ std::string App::liveLoopCurrentLabel() const {
         return {};
     const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
     return m_liveLoopLabels[slot];
+}
+
+std::string App::liveLoopLabelAtFrame(int index) const {
+    if (m_liveLoopCount <= 0)
+        return {};
+    if (index < 0 || index >= m_liveLoopCount)
+        return {};
+    const int slot = liveLoopSlotForIndex(index);
+    return m_liveLoopLabels[slot];
+}
+
+std::string App::liveLoopVolumeKeyAtFrame(int index) const {
+    if (m_liveLoopCount <= 0)
+        return {};
+    if (index < 0 || index >= m_liveLoopCount)
+        return {};
+    const int slot = liveLoopSlotForIndex(index);
+    return m_liveLoopVolumeKeys[slot];
 }
 
 void App::clearLiveLoop() {
@@ -3458,8 +3595,7 @@ bool App::stationUploadMatchesSelection(const StationState& st) const {
     return lowestSweepUpload || st.uploaded_tilt == m_activeTilt;
 }
 
-void App::invalidateFrameCache(bool freeMemory) {
-    invalidateLiveLoop(freeMemory);
+void App::resetHistoricFrameCache(bool freeMemory) {
     if (freeMemory) {
         for (auto& frame : m_cachedFrames) {
             if (frame) {
@@ -3472,6 +3608,11 @@ void App::invalidateFrameCache(bool freeMemory) {
     m_cachedFrameWidth = 0;
     m_cachedFrameHeight = 0;
     m_memoryTelemetry.historic_cache_bytes = 0;
+}
+
+void App::invalidateFrameCache(bool freeMemory) {
+    invalidateLiveLoop(freeMemory);
+    resetHistoricFrameCache(freeMemory);
 }
 
 void App::ensureCrossSectionBuffer(int width, int height) {
@@ -3534,7 +3675,6 @@ void App::rebuildVolumeForCurrentSelection() {
                     gp[p] = pc.products[p].gates.data();
             }
             gpu::uploadStationData(slot, info, pc.azimuths.data(), gp);
-            gpu::syncStation(slot);
 
             sweepInfos[builtSweeps] = info;
             azPtrs[builtSweeps] = gpu::getStationAzimuths(slot);
@@ -3744,7 +3884,6 @@ void App::buildSpatialGrid() {
 void App::invalidatePanelCaches() {
     for (int i = 0; i < (int)m_panelCacheStates.size(); ++i) {
         m_panelCacheStates[i] = {};
-        gpu::freeStation(kPanelCacheSlotBase + i);
     }
 }
 
@@ -3789,10 +3928,32 @@ bool App::uploadSweepSetToSlot(int slot,
 
     gpu::allocateStation(slot, info);
     gpu::uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
-    gpu::syncStation(slot);
     if (outElevationAngle)
         *outElevationAngle = pc.elevation_angle;
     return true;
+}
+
+bool App::uploadLiveLoopFrameToSlot(int slot, const std::string& volumeKey,
+                                    int product, int tilt,
+                                    float* outElevationAngle) {
+    if (volumeKey.empty() || m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size())
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (!st.enabled)
+        return false;
+
+    for (const auto& entry : st.live_history) {
+        if (entry.volume_key != volumeKey)
+            continue;
+        return uploadSweepSetToSlot(slot,
+                                    entry.sweeps,
+                                    entry.station_lat != 0.0f ? entry.station_lat : st.lat,
+                                    entry.station_lon != 0.0f ? entry.station_lon : st.lon,
+                                    product, tilt, outElevationAngle);
+    }
+    return false;
 }
 
 bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* outElevationAngle) {
@@ -3834,6 +3995,25 @@ bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* ou
 
     if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size())
         return false;
+
+    if (liveLoopViewingHistory()) {
+        const std::string volumeKey = liveLoopVolumeKeyAtFrame(m_liveLoopPlaybackIndex);
+        const auto& cache = m_panelCacheStates[paneIndex];
+        if (cache.valid && !cache.historic &&
+            cache.station_idx == m_activeStationIdx &&
+            cache.product == product &&
+            cache.tilt == tilt &&
+            cache.volume_key == volumeKey) {
+            return true;
+        }
+
+        if (!uploadLiveLoopFrameToSlot(slot, volumeKey, product, tilt, outElevationAngle)) {
+            m_panelCacheStates[paneIndex] = {};
+            return false;
+        }
+        m_panelCacheStates[paneIndex] = {true, false, m_activeStationIdx, -1, product, tilt, volumeKey};
+        return true;
+    }
 
     bool needsPromotion = tilt > 0;
     {
@@ -4037,6 +4217,12 @@ void App::update(float dt) {
         m_lastLivePollSweep = now;
     }
 
+    if (m_liveLoopLocalRefreshPending.exchange(false) &&
+        m_liveLoopEnabled && !m_snapshotMode && !m_historicMode &&
+        !m_mode3D && !m_crossSection && !m_showAll) {
+        requestLiveLoopBackfillForViewRefresh();
+    }
+
     processLiveLoopBackfill();
     updateLiveLoop(dt);
     m_basemap.update(m_viewport);
@@ -4106,10 +4292,18 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
             return;
         }
 
-        const int slot = primaryPane ? 0 : (kPanelCacheSlotBase + paneIndex);
+        bool canUsePrimarySlot = false;
+        if (!primaryPane && !m_stations.empty()) {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            canUsePrimarySlot =
+                m_stations[0].uploaded &&
+                m_stations[0].gpuInfo.has_product[product];
+        }
+
+        const int slot = (primaryPane || canUsePrimarySlot) ? 0 : (kPanelCacheSlotBase + paneIndex);
         bool uploaded = primaryPane
             ? (m_historic.frame(currentFrame) && m_historic.frame(currentFrame)->ready)
-            : ensurePanelCacheUpload(paneIndex, product, m_activeTilt);
+            : (canUsePrimarySlot || ensurePanelCacheUpload(paneIndex, product, m_activeTilt));
         if (!uploaded) {
             CUDA_CHECK(cudaMemset(d_output, 0, (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
             return;
@@ -4158,12 +4352,31 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
                 CUDA_CHECK(cudaMemset(d_output, 0,
                             (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
             }
-        } else if (ensurePanelCacheUpload(paneIndex, product, m_activeTilt)) {
-            gpu::forwardRenderStation(gpuVp, kPanelCacheSlotBase + paneIndex,
-                                      product, activeThreshold, d_output, srvSpd, srvDir);
         } else {
-            CUDA_CHECK(cudaMemset(d_output, 0,
-                        (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
+            bool canUsePrimarySlot = !liveLoopViewingHistory();
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                if (m_activeStationIdx < (int)m_stations.size()) {
+                    const auto& st = m_stations[m_activeStationIdx];
+                    canUsePrimarySlot =
+                        canUsePrimarySlot &&
+                        st.enabled &&
+                        st.uploaded &&
+                        stationUploadMatchesSelection(st) &&
+                        st.gpuInfo.has_product[product];
+                }
+            }
+
+            if (canUsePrimarySlot) {
+                gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
+                                          product, activeThreshold, d_output, srvSpd, srvDir);
+            } else if (ensurePanelCacheUpload(paneIndex, product, m_activeTilt)) {
+                gpu::forwardRenderStation(gpuVp, kPanelCacheSlotBase + paneIndex,
+                                          product, activeThreshold, d_output, srvSpd, srvDir);
+            } else {
+                CUDA_CHECK(cudaMemset(d_output, 0,
+                            (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
+            }
         }
     } else {
         CUDA_CHECK(cudaMemset(d_output, 0,
@@ -4177,8 +4390,14 @@ void App::renderPane(int paneIndex, uint32_t* d_output) {
         !m_crossSection &&
         m_liveLoopEnabled &&
         m_liveLoopCapturePending) {
+        std::string latestKey;
+        if (m_activeStationIdx >= 0 && m_activeStationIdx < (int)m_stations.size()) {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            latestKey = m_stations[m_activeStationIdx].latestVolumeKey;
+        }
         captureLiveLoopFrame(d_output, gpuVp.width, gpuVp.height,
-                             currentLiveLoopCaptureLabel());
+                             currentLiveLoopCaptureLabel(),
+                             latestKey);
     }
 }
 
@@ -4238,14 +4457,21 @@ void App::render() {
 }
 
 void App::onScroll(double xoff, double yoff) {
-    invalidateFrameCache(true);
     if (m_mode3D) {
+        invalidateFrameCache(true);
         m_camera.distance *= (yoff > 0) ? 0.9f : 1.1f;
         m_camera.distance = std::max(50.0f, std::min(1500.0f, m_camera.distance));
     } else {
         double factor = (yoff > 0) ? 1.15 : 1.0 / 1.15;
         m_viewport.zoom *= factor;
         m_viewport.zoom = std::max(1.0, std::min(m_viewport.zoom, 2000.0));
+        if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
+            !m_showAll && !m_mode3D && !m_crossSection) {
+            resetHistoricFrameCache(true);
+            scheduleInteractiveLiveLoopBackfill();
+        } else {
+            invalidateFrameCache(true);
+        }
     }
 }
 
@@ -4263,7 +4489,13 @@ void App::onMouseDrag(double dx, double dy) {
     } else {
         m_viewport.center_lon -= dx / m_viewport.zoom;
         m_viewport.center_lat += dy / m_viewport.zoom;
-        invalidateFrameCache(true);
+        if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode &&
+            !m_showAll && !m_mode3D && !m_crossSection) {
+            resetHistoricFrameCache(true);
+            scheduleInteractiveLiveLoopBackfill();
+        } else {
+            invalidateFrameCache(true);
+        }
     }
 }
 
@@ -4312,6 +4544,9 @@ void App::onMouseMove(double mx, double my) {
             uploadStation(bestIdx);
         if (enabled && !m_snapshotMode && !m_historicMode)
             queueLiveStationRefresh(bestIdx, true);
+        if (enabled && m_liveLoopEnabled && !m_snapshotMode && !m_historicMode &&
+            !m_showAll && !m_mode3D && !m_crossSection)
+            requestLiveLoopBackfill();
         trimStationWorkingSet(bestIdx);
         trimLiveHistoryWorkingSet(bestIdx);
     }
@@ -4467,6 +4702,8 @@ void App::onFramebufferResize(int w, int h) {
 void App::setProduct(int p) {
     if (p < 0 || p >= (int)Product::COUNT) return;
     if (p == m_activeProduct) return;
+    const bool refreshLiveLoop =
+        m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll;
     m_activeProduct = p;
     m_radarPanels[0].product = p;
     m_activeTilt = 0; // reset tilt - different products have different valid tilts
@@ -4475,7 +4712,9 @@ void App::setProduct(int p) {
     m_volumeBuilt = false;
     m_volumeStation = -1;
     invalidatePanelCaches();
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
+    if (!refreshLiveLoop)
+        invalidateLiveLoop(true);
     m_needsRerender = true;
 
     if (m_historicMode) {
@@ -4493,8 +4732,8 @@ void App::setProduct(int p) {
     }
     trimStationWorkingSet(m_activeStationIdx);
     refreshActiveTiltMetadata();
-    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
-        requestLiveLoopBackfill();
+    if (refreshLiveLoop)
+        scheduleInteractiveLiveLoopBackfill();
 }
 
 void App::nextProduct() { setProduct((m_activeProduct + 1) % (int)Product::COUNT); }
@@ -4503,6 +4742,8 @@ void App::prevProduct() { setProduct((m_activeProduct - 1 + (int)Product::COUNT)
 void App::setTilt(int t) {
     if (!m_showAll && !m_snapshotMode && !m_historicMode && m_activeStationIdx >= 0)
         ensureStationFullVolume(m_activeStationIdx);
+    const bool refreshLiveLoop =
+        m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll;
     m_maxTilts = currentAvailableTilts();
     if (t < 0) t = 0;
     if (t >= m_maxTilts) t = m_maxTilts - 1;
@@ -4514,7 +4755,9 @@ void App::setTilt(int t) {
     m_volumeBuilt = false;
     m_volumeStation = -1;
     invalidatePanelCaches();
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
+    if (!refreshLiveLoop)
+        invalidateLiveLoop(true);
 
     if (m_historicMode) {
         m_lastHistoricFrame = -1; // force re-upload with new tilt
@@ -4524,15 +4767,14 @@ void App::setTilt(int t) {
                 uploadStation(i);
         } else if (m_activeStationIdx >= 0) {
             uploadStation(m_activeStationIdx);
-            gpu::syncStation(m_activeStationIdx);
         }
     }
     if (m_crossSection || m_mode3D)
         rebuildVolumeForCurrentSelection();
     trimStationWorkingSet(m_activeStationIdx);
     refreshActiveTiltMetadata();
-    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
-        requestLiveLoopBackfill();
+    if (refreshLiveLoop)
+        scheduleInteractiveLiveLoopBackfill();
     m_needsRerender = true;
 }
 
@@ -4549,7 +4791,7 @@ void App::setDbzMinThreshold(float v) {
         invalidateFrameCache(true);
     m_needsRerender = true;
     if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
-        requestLiveLoopBackfill();
+        scheduleInteractiveLiveLoopBackfill();
 }
 
 void App::onRightDrag(double dx, double dy) {
@@ -4628,19 +4870,23 @@ void App::toggle3D() {
 
 void App::toggleSRV() {
     m_srvMode = !m_srvMode;
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
+    if (!(m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll))
+        invalidateLiveLoop(true);
     m_needsRerender = true;
     if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
-        requestLiveLoopBackfill();
+        scheduleInteractiveLiveLoopBackfill();
 }
 
 void App::setStormMotion(float speed, float dir) {
     m_stormSpeed = speed;
     m_stormDir = dir;
-    invalidateFrameCache(true);
+    resetHistoricFrameCache(true);
+    if (!(m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll))
+        invalidateLiveLoop(true);
     m_needsRerender = true;
     if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
-        requestLiveLoopBackfill();
+        scheduleInteractiveLiveLoopBackfill();
 }
 
 void App::rerenderAll() {
@@ -4756,7 +5002,6 @@ void App::uploadHistoricFrame(int frameIdx) {
         if (pc.products[p].has_data && !pc.products[p].gates.empty())
             gatePtrs[p] = pc.products[p].gates.data();
     gpu::uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
-    gpu::syncStation(slot);
 
     // Update station state for rendering
     if (m_stations.size() > 0) {
