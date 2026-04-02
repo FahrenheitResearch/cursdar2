@@ -1147,10 +1147,17 @@ Detection computeDetectionForSweeps(const std::vector<PrecomputedSweep>& sweeps,
 
 static int findProductSweep(const std::vector<PrecomputedSweep>& sweeps, int product, int tiltIdx);
 static int countProductSweeps(const std::vector<PrecomputedSweep>& sweeps, int product);
+static constexpr int kPanelCacheSlotBase = MAX_STATIONS - 5;
 
 App::App()
     : m_spatialGrid(std::make_unique<SpatialGrid>()) {
     m_priorityStatus = "Startup seed pending";
+    m_warningOptions.enabled = false;
+    m_warningOptions.showWarnings = false;
+    m_warningOptions.showWatches = false;
+    m_warningOptions.showStatements = false;
+    m_warningOptions.showAdvisories = false;
+    m_warningOptions.showSpecialWeatherStatements = false;
 }
 
 App::~App() {
@@ -1163,6 +1170,8 @@ App::~App() {
     gpu::freeVolume();
     m_xsTex.destroy();
     m_outputTex.destroy();
+    for (auto& tex : m_panelTextures)
+        tex.destroy();
     gpu::shutdown();
 }
 
@@ -1189,6 +1198,8 @@ bool App::init(int windowWidth, int windowHeight,
     m_viewport.zoom = 28.0; // pixels per degree - shows full CONUS
     m_viewport.width = windowWidth;
     m_viewport.height = windowHeight;
+    m_radarCanvasWidth = windowWidth;
+    m_radarCanvasHeight = windowHeight;
     ensureRenderTargets();
 
     // Initialize station states
@@ -1229,11 +1240,140 @@ PerformanceProfile App::recommendedPerformanceProfile() const {
 }
 
 int App::renderWidth() const {
-    return std::max(1, (int)std::lround((double)m_windowWidth * m_renderScale));
+    return panelRenderWidth(0);
 }
 
 int App::renderHeight() const {
-    return std::max(1, (int)std::lround((double)m_windowHeight * m_renderScale));
+    return panelRenderHeight(0);
+}
+
+int App::panelRenderCount() const {
+    if (m_mode3D || m_crossSection)
+        return 1;
+    return std::max(1, (int)m_radarPanelLayout);
+}
+
+int App::radarPanelCount() const {
+    return panelRenderCount();
+}
+
+RadarPanelRect App::radarPanelRect(int index) const {
+    const int count = panelRenderCount();
+    if (index < 0 || index >= count)
+        return {};
+
+    RadarPanelRect rect = {};
+    if (count <= 1) {
+        rect.x = 0;
+        rect.y = 0;
+        rect.width = std::max(1, m_viewport.width);
+        rect.height = std::max(1, m_viewport.height);
+        return rect;
+    }
+
+    const int canvasX = m_radarCanvasX;
+    const int canvasY = m_radarCanvasY;
+    const int canvasWidth = std::max(1, m_radarCanvasWidth > 0 ? m_radarCanvasWidth : m_viewport.width);
+    const int canvasHeight = std::max(1, m_radarCanvasHeight > 0 ? m_radarCanvasHeight : m_viewport.height);
+
+    if (count == 2) {
+        const int leftWidth = std::max(1, canvasWidth / 2);
+        const int rightWidth = std::max(1, canvasWidth - leftWidth);
+        rect.x = canvasX + ((index == 0) ? 0 : leftWidth);
+        rect.y = canvasY;
+        rect.width = (index == 0) ? leftWidth : rightWidth;
+        rect.height = canvasHeight;
+        return rect;
+    }
+
+    const int leftWidth = std::max(1, canvasWidth / 2);
+    const int rightWidth = std::max(1, canvasWidth - leftWidth);
+    const int topHeight = std::max(1, canvasHeight / 2);
+    const int bottomHeight = std::max(1, canvasHeight - topHeight);
+    const int col = index % 2;
+    const int row = index / 2;
+    rect.x = canvasX + ((col == 0) ? 0 : leftWidth);
+    rect.y = canvasY + ((row == 0) ? 0 : topHeight);
+    rect.width = (col == 0) ? leftWidth : rightWidth;
+    rect.height = (row == 0) ? topHeight : bottomHeight;
+    return rect;
+}
+
+int App::panelRenderWidth(int index) const {
+    RadarPanelRect rect = radarPanelRect(index);
+    return std::max(1, (int)std::lround((double)rect.width * m_renderScale));
+}
+
+int App::panelRenderHeight(int index) const {
+    RadarPanelRect rect = radarPanelRect(index);
+    return std::max(1, (int)std::lround((double)rect.height * m_renderScale));
+}
+
+GlCudaTexture& App::panelTexture(int index) {
+    if (index <= 0)
+        return m_outputTex;
+    index = std::min(index, 3);
+    return m_panelTextures[index - 1];
+}
+
+const GlCudaTexture& App::panelTexture(int index) const {
+    if (index <= 0)
+        return m_outputTex;
+    index = std::min(index, 3);
+    return m_panelTextures[index - 1];
+}
+
+int App::radarPanelProduct(int index) const {
+    if (index <= 0)
+        return m_activeProduct;
+    if (index >= (int)m_radarPanels.size())
+        return m_activeProduct;
+    return m_radarPanels[index].product;
+}
+
+void App::setRadarPanelLayout(RadarPanelLayout layout) {
+    if (m_radarPanelLayout == layout)
+        return;
+    m_radarPanelLayout = layout;
+    invalidatePanelCaches();
+    invalidateFrameCache(true);
+    invalidateLiveLoop(true);
+    ensureRenderTargets();
+    m_needsRerender = true;
+    updateMemoryTelemetry(true);
+}
+
+void App::setRadarPanelProduct(int index, int product) {
+    if (product < 0 || product >= (int)Product::COUNT)
+        return;
+    if (index <= 0) {
+        setProduct(product);
+        return;
+    }
+    if (index >= (int)m_radarPanels.size() || m_radarPanels[index].product == product)
+        return;
+    m_radarPanels[index].product = product;
+    m_panelCacheStates[index].valid = false;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+}
+
+void App::setRadarCanvasRect(int x, int y, int width, int height) {
+    width = std::max(1, width);
+    height = std::max(1, height);
+    if (m_radarCanvasX == x &&
+        m_radarCanvasY == y &&
+        m_radarCanvasWidth == width &&
+        m_radarCanvasHeight == height) {
+        return;
+    }
+    m_radarCanvasX = x;
+    m_radarCanvasY = y;
+    m_radarCanvasWidth = width;
+    m_radarCanvasHeight = height;
+    ensureRenderTargets();
+    invalidateFrameCache(true);
+    m_needsRerender = true;
 }
 
 int App::historicFrameCacheLimit() const {
@@ -1462,6 +1602,21 @@ void App::ensureRenderTargets() {
         fprintf(stderr, "Failed to create output texture (%dx%d)\n", rw, rh);
     }
 
+    const int panelCount = panelRenderCount();
+    for (int i = 1; i < 4; ++i) {
+        if (i < panelCount) {
+            const int pw = panelRenderWidth(i);
+            const int ph = panelRenderHeight(i);
+            GlCudaTexture& tex = m_panelTextures[i - 1];
+            const bool ready = tex.textureId() != 0;
+            const bool ok = ready ? tex.resize(pw, ph) : tex.init(pw, ph);
+            if (!ok)
+                fprintf(stderr, "Failed to create panel texture %d (%dx%d)\n", i, pw, ph);
+        } else {
+            m_panelTextures[i - 1].destroy();
+        }
+    }
+
     m_memoryTelemetry.internal_render_width = rw;
     m_memoryTelemetry.internal_render_height = rh;
     m_memoryTelemetry.render_scale = m_renderScale;
@@ -1543,6 +1698,36 @@ int App::enabledStationCount() const {
     for (const auto& st : m_stations)
         count += st.enabled ? 1 : 0;
     return count;
+}
+
+void App::setShowExperimentalSites(bool show) {
+    if (m_showExperimentalSites == show)
+        return;
+
+    m_showExperimentalSites = show;
+    invalidatePanelCaches();
+    if (show)
+        return;
+
+    std::vector<int> experimentalEnabled;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        for (const auto& st : m_stations) {
+            if (NEXRAD_STATIONS[st.index].experimental && st.enabled)
+                experimentalEnabled.push_back(st.index);
+        }
+    }
+    for (int idx : experimentalEnabled)
+        setStationEnabled(idx, false);
+
+    if (m_activeStationIdx >= 0 &&
+        m_activeStationIdx < m_stationsTotal &&
+        NEXRAD_STATIONS[m_activeStationIdx].experimental) {
+        m_activeStationIdx = -1;
+        m_autoTrackStation = true;
+        invalidateLiveLoop(false);
+        m_needsRerender = true;
+    }
 }
 
 void App::setStationEnabled(int idx, bool enabled) {
@@ -3556,6 +3741,150 @@ void App::buildSpatialGrid() {
     m_gridDirty = false;
 }
 
+void App::invalidatePanelCaches() {
+    for (int i = 0; i < (int)m_panelCacheStates.size(); ++i) {
+        m_panelCacheStates[i] = {};
+        gpu::freeStation(kPanelCacheSlotBase + i);
+    }
+}
+
+bool App::uploadSweepSetToSlot(int slot,
+                               const std::vector<PrecomputedSweep>& sweeps,
+                               float stationLat, float stationLon,
+                               int product, int tilt,
+                               float* outElevationAngle) const {
+    const int productTilts = countProductSweeps(sweeps, product);
+    if (productTilts <= 0)
+        return false;
+
+    const int clampedTilt = std::max(0, std::min(tilt, productTilts - 1));
+    const int sweepIdx = findProductSweep(sweeps, product, clampedTilt);
+    if (sweepIdx < 0 || sweepIdx >= (int)sweeps.size())
+        return false;
+
+    const auto& pc = sweeps[sweepIdx];
+    if (pc.num_radials <= 0)
+        return false;
+
+    GpuStationInfo info = {};
+    info.lat = stationLat;
+    info.lon = stationLon;
+    info.elevation_angle = pc.elevation_angle;
+    info.num_radials = pc.num_radials;
+
+    const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+    for (int p = 0; p < NUM_PRODUCTS; ++p) {
+        const auto& pd = pc.products[p];
+        if (!pd.has_data)
+            continue;
+        info.has_product[p] = true;
+        info.num_gates[p] = pd.num_gates;
+        info.first_gate_km[p] = pd.first_gate_km;
+        info.gate_spacing_km[p] = pd.gate_spacing_km;
+        info.scale[p] = pd.scale;
+        info.offset[p] = pd.offset;
+        if (!pd.gates.empty())
+            gatePtrs[p] = pd.gates.data();
+    }
+
+    gpu::allocateStation(slot, info);
+    gpu::uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
+    gpu::syncStation(slot);
+    if (outElevationAngle)
+        *outElevationAngle = pc.elevation_angle;
+    return true;
+}
+
+bool App::ensurePanelCacheUpload(int paneIndex, int product, int tilt, float* outElevationAngle) {
+    if (paneIndex < 0 || paneIndex >= 4)
+        return false;
+    const int slot = kPanelCacheSlotBase + paneIndex;
+
+    if (m_historicMode) {
+        const int frameIdx = m_historic.currentFrame();
+        const RadarFrame* fr = m_historic.frame(frameIdx);
+        if (!fr || !fr->ready || fr->sweeps.empty())
+            return false;
+
+        const auto& cache = m_panelCacheStates[paneIndex];
+        if (cache.valid && cache.historic &&
+            cache.frame_idx == frameIdx &&
+            cache.product == product &&
+            cache.tilt == tilt) {
+            if (outElevationAngle) {
+                const int productTilts = countProductSweeps(fr->sweeps, product);
+                if (productTilts > 0) {
+                    const int sweepIdx = findProductSweep(fr->sweeps, product,
+                                                          std::max(0, std::min(tilt, productTilts - 1)));
+                    if (sweepIdx >= 0)
+                        *outElevationAngle = fr->sweeps[sweepIdx].elevation_angle;
+                }
+            }
+            return true;
+        }
+
+        if (!uploadSweepSetToSlot(slot, fr->sweeps, fr->station_lat, fr->station_lon,
+                                  product, tilt, outElevationAngle)) {
+            m_panelCacheStates[paneIndex] = {};
+            return false;
+        }
+        m_panelCacheStates[paneIndex] = {true, true, -1, frameIdx, product, tilt, fr->timestamp};
+        return true;
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size())
+        return false;
+
+    bool needsPromotion = tilt > 0;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        const auto& st = m_stations[m_activeStationIdx];
+        const int productTilts = countProductSweeps(st.precomputed, product);
+        const bool missingProduct = productTilts <= 0;
+        const bool missingTilt = productTilts > 0 && tilt >= productTilts;
+        const bool trimmedMissing =
+            !st.full_volume_resident &&
+            st.total_sweeps > (int)st.precomputed.size() &&
+            (missingProduct || missingTilt);
+        needsPromotion = needsPromotion || trimmedMissing;
+    }
+    if (needsPromotion)
+        ensureStationFullVolume(m_activeStationIdx);
+
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (!st.enabled || st.precomputed.empty())
+        return false;
+
+    const auto& cache = m_panelCacheStates[paneIndex];
+    if (cache.valid && !cache.historic &&
+        cache.station_idx == m_activeStationIdx &&
+        cache.product == product &&
+        cache.tilt == tilt &&
+        cache.volume_key == st.latestVolumeKey) {
+        if (outElevationAngle) {
+            const int productTilts = countProductSweeps(st.precomputed, product);
+            if (productTilts > 0) {
+                const int sweepIdx = findProductSweep(st.precomputed, product,
+                                                      std::max(0, std::min(tilt, productTilts - 1)));
+                if (sweepIdx >= 0)
+                    *outElevationAngle = st.precomputed[sweepIdx].elevation_angle;
+            }
+        }
+        return true;
+    }
+
+    if (!uploadSweepSetToSlot(slot, st.precomputed,
+                              st.data_lat != 0.0f ? st.data_lat : st.lat,
+                              st.data_lon != 0.0f ? st.data_lon : st.lon,
+                              product, tilt, outElevationAngle)) {
+        m_panelCacheStates[paneIndex] = {};
+        return false;
+    }
+    m_panelCacheStates[paneIndex] = {true, false, m_activeStationIdx, -1, product, tilt, st.latestVolumeKey};
+    return true;
+}
+
 void App::updateLivePolling(std::chrono::steady_clock::time_point now) {
     std::vector<int> activeDue;
     std::vector<std::pair<int, float>> priorityDue;
@@ -3713,93 +4042,100 @@ void App::update(float dt) {
     m_basemap.update(m_viewport);
 }
 
-void App::render() {
-    // Rebuild spatial grid if needed
-    if (m_gridDirty) {
-        buildSpatialGrid();
+void App::renderPane(int paneIndex, uint32_t* d_output) {
+    const int product = (paneIndex == 0) ? m_activeProduct : radarPanelProduct(paneIndex);
+    const int rw = panelRenderWidth(paneIndex);
+    const int rh = panelRenderHeight(paneIndex);
+    GpuViewport gpuVp;
+    gpuVp.center_lat = (float)m_viewport.center_lat;
+    gpuVp.center_lon = (float)m_viewport.center_lon;
+    gpuVp.deg_per_pixel_x =
+        (1.0f / (float)m_viewport.zoom) * ((float)radarPanelRect(paneIndex).width / (float)rw);
+    gpuVp.deg_per_pixel_y =
+        (1.0f / (float)m_viewport.zoom) * ((float)radarPanelRect(paneIndex).height / (float)rh);
+    gpuVp.width = rw;
+    gpuVp.height = rh;
+
+    const float srvSpd = (m_srvMode && product == PROD_VEL) ? m_stormSpeed : 0.0f;
+    const float srvDir = m_stormDir;
+    const float activeThreshold = (product == PROD_VEL)
+        ? m_velocityMinThreshold
+        : m_dbzMinThreshold;
+    const bool primaryPane = (paneIndex == 0);
+    const bool capturePending =
+        primaryPane &&
+        m_liveLoopEnabled &&
+        m_liveLoopCapturePending &&
+        !m_historicMode &&
+        !m_snapshotMode &&
+        !m_mode3D &&
+        !m_crossSection;
+    const bool useLiveLoopFrame =
+        primaryPane &&
+        !m_historicMode &&
+        !m_snapshotMode &&
+        !m_mode3D &&
+        !m_crossSection &&
+        m_liveLoopEnabled &&
+        m_liveLoopCount > 0 &&
+        !capturePending &&
+        (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1)) &&
+        m_liveLoopFrameWidth == gpuVp.width &&
+        m_liveLoopFrameHeight == gpuVp.height;
+
+    if (useLiveLoopFrame) {
+        const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
+        CUDA_CHECK(cudaMemcpy(d_output, m_liveLoopFrames[slot],
+                              (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
+                              cudaMemcpyDeviceToDevice));
+        return;
     }
 
-    {
-        const int rw = renderWidth();
-        const int rh = renderHeight();
-        GpuViewport gpuVp;
-        gpuVp.center_lat = (float)m_viewport.center_lat;
-        gpuVp.center_lon = (float)m_viewport.center_lon;
-        gpuVp.deg_per_pixel_x =
-            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.width / (float)rw);
-        gpuVp.deg_per_pixel_y =
-            (1.0f / (float)m_viewport.zoom) * ((float)m_viewport.height / (float)rh);
-        gpuVp.width = rw;
-        gpuVp.height = rh;
+    if (m_mode3D && m_volumeBuilt) {
+        gpu::renderVolume(m_camera, gpuVp.width, gpuVp.height,
+                          product, activeThreshold, d_output);
+        return;
+    }
 
-        float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
-        float srvDir = m_stormDir;
-        float activeThreshold = (m_activeProduct == PROD_VEL)
-            ? m_velocityMinThreshold
-            : m_dbzMinThreshold;
-        const bool capturePending =
-            m_liveLoopEnabled &&
-            m_liveLoopCapturePending &&
-            !m_historicMode &&
-            !m_snapshotMode &&
-            !m_mode3D &&
-            !m_crossSection;
-        const bool useLiveLoopFrame =
-            !m_historicMode &&
-            !m_snapshotMode &&
-            !m_mode3D &&
-            !m_crossSection &&
-            m_liveLoopEnabled &&
-            m_liveLoopCount > 0 &&
-            !capturePending &&
-            (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1)) &&
-            m_liveLoopFrameWidth == gpuVp.width &&
-            m_liveLoopFrameHeight == gpuVp.height;
-
-        if (useLiveLoopFrame) {
-            const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
-            CUDA_CHECK(cudaMemcpy(m_d_compositeOutput, m_liveLoopFrames[slot],
+    if (m_historicMode) {
+        const int currentFrame = m_historic.currentFrame();
+        if (primaryPane && hasCachedFrame(currentFrame, gpuVp.width, gpuVp.height)) {
+            CUDA_CHECK(cudaMemcpy(d_output, m_cachedFrames[currentFrame],
                                   (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
                                   cudaMemcpyDeviceToDevice));
-        } else if (m_mode3D && m_volumeBuilt) {
-            // 3D volumetric ray march
-            gpu::renderVolume(m_camera, gpuVp.width, gpuVp.height,
-                              m_activeProduct, activeThreshold,
-                              m_d_compositeOutput);
-        } else if (m_historicMode) {
-            int cf = m_historic.currentFrame();
-            if (hasCachedFrame(cf, gpuVp.width, gpuVp.height)) {
-                // Use pre-baked cached frame (zero render cost)
-                CUDA_CHECK(cudaMemcpy(m_d_compositeOutput, m_cachedFrames[cf],
-                                      (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t),
-                                      cudaMemcpyDeviceToDevice));
-            } else {
-                if (m_activeProduct == PROD_VEL) {
-                    gpu::forwardRenderStation(gpuVp, 0,
-                                              m_activeProduct, activeThreshold,
-                                              m_d_compositeOutput, srvSpd, srvDir);
-                } else {
-                    gpu::renderSingleStation(gpuVp, 0,
-                                             m_activeProduct, activeThreshold,
-                                             m_d_compositeOutput, srvSpd, srvDir);
-                }
-                // Cache this rendered frame for instant replay
-                cacheAnimFrame(cf, m_d_compositeOutput, gpuVp.width, gpuVp.height);
-            }
-        } else if (m_showAll) {
-            // Mosaic: all stations
-            if (m_gridDirty) buildSpatialGrid();
-            std::vector<GpuStationInfo> gpuInfos(m_stations.size());
-            {
-                std::lock_guard<std::mutex> lock(m_stationMutex);
-                for (int i = 0; i < (int)m_stations.size(); i++)
-                    gpuInfos[i] = m_stations[i].gpuInfo;
-            }
-            gpu::renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
-                              *m_spatialGrid, m_activeProduct, activeThreshold,
-                              m_d_compositeOutput);
-        } else if (m_activeStationIdx >= 0) {
-            // Single station: fast path
+            return;
+        }
+
+        const int slot = primaryPane ? 0 : (kPanelCacheSlotBase + paneIndex);
+        bool uploaded = primaryPane
+            ? (m_historic.frame(currentFrame) && m_historic.frame(currentFrame)->ready)
+            : ensurePanelCacheUpload(paneIndex, product, m_activeTilt);
+        if (!uploaded) {
+            CUDA_CHECK(cudaMemset(d_output, 0, (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
+            return;
+        }
+        gpu::forwardRenderStation(gpuVp, slot, product, activeThreshold, d_output, srvSpd, srvDir);
+        if (primaryPane)
+            cacheAnimFrame(currentFrame, d_output, gpuVp.width, gpuVp.height);
+        return;
+    }
+
+    if (m_showAll) {
+        if (m_gridDirty)
+            buildSpatialGrid();
+        std::vector<GpuStationInfo> gpuInfos(m_stations.size());
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            for (int i = 0; i < (int)m_stations.size(); i++)
+                gpuInfos[i] = m_stations[i].gpuInfo;
+        }
+        gpu::renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
+                          *m_spatialGrid, product, activeThreshold, d_output);
+        return;
+    }
+
+    if (m_activeStationIdx >= 0) {
+        if (primaryPane) {
             bool needsUpload = false;
             bool canRender = false;
             if (m_activeStationIdx < (int)m_stations.size()) {
@@ -3816,60 +4152,89 @@ void App::render() {
             }
             if (canRender) {
                 gpu::forwardRenderStation(gpuVp, m_activeStationIdx,
-                                          m_activeProduct, activeThreshold,
-                                          m_d_compositeOutput, srvSpd, srvDir);
+                                          product, activeThreshold,
+                                          d_output, srvSpd, srvDir);
             } else {
-                CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0,
+                CUDA_CHECK(cudaMemset(d_output, 0,
                             (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
             }
+        } else if (ensurePanelCacheUpload(paneIndex, product, m_activeTilt)) {
+            gpu::forwardRenderStation(gpuVp, kPanelCacheSlotBase + paneIndex,
+                                      product, activeThreshold, d_output, srvSpd, srvDir);
         } else {
-            CUDA_CHECK(cudaMemset(m_d_compositeOutput, 0,
+            CUDA_CHECK(cudaMemset(d_output, 0,
                         (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
         }
-
-        if (!useLiveLoopFrame &&
-            !m_historicMode &&
-            !m_snapshotMode &&
-            !m_mode3D &&
-            !m_crossSection &&
-            m_liveLoopEnabled &&
-            m_liveLoopCapturePending) {
-            captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height,
-                                 currentLiveLoopCaptureLabel());
-        }
-        // Cross-section: render to separate texture for floating panel
-        // In historic mode, use slot 0's data; otherwise use active station
-        int xsStationSlot = m_historicMode ? 0 : m_activeStationIdx;
-        if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
-            xsStationSlot < (int)m_stations.size()) {
-            GpuStationInfo stInfo = {};
-            {
-                std::lock_guard<std::mutex> lock(m_stationMutex);
-                stInfo = m_stations[xsStationSlot].gpuInfo;
-            }
-            m_xsWidth = gpuVp.width;
-            m_xsHeight = gpuVp.height / 3;
-            if (m_xsHeight < 200) m_xsHeight = 200;
-
-            // Ensure cross-section GPU buffer and GL texture exist
-            ensureCrossSectionBuffer(m_xsWidth, m_xsHeight);
-            m_xsTex.resize(m_xsWidth, m_xsHeight);
-
-            gpu::renderCrossSection(
-                m_activeStationIdx, m_activeProduct, activeThreshold,
-                m_xsStartLat, m_xsStartLon, m_xsEndLat, m_xsEndLon,
-                stInfo.lat, stInfo.lon,
-                m_xsWidth, m_xsHeight, m_d_xsOutput);
-
-            // Copy to its own GL texture
-            m_xsTex.updateFromDevice(m_d_xsOutput, m_xsWidth, m_xsHeight);
-        }
-
-        CUDA_CHECK(cudaDeviceSynchronize());
-        m_outputTex.updateFromDevice(m_d_compositeOutput,
-                                      gpuVp.width, gpuVp.height);
-        updateMemoryTelemetry();
+    } else {
+        CUDA_CHECK(cudaMemset(d_output, 0,
+                    (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t)));
     }
+
+    if (primaryPane &&
+        !m_historicMode &&
+        !m_snapshotMode &&
+        !m_mode3D &&
+        !m_crossSection &&
+        m_liveLoopEnabled &&
+        m_liveLoopCapturePending) {
+        captureLiveLoopFrame(d_output, gpuVp.width, gpuVp.height,
+                             currentLiveLoopCaptureLabel());
+    }
+}
+
+void App::render() {
+    if (m_gridDirty)
+        buildSpatialGrid();
+
+    const int paneCount = panelRenderCount();
+    for (int pane = 0; pane < paneCount; ++pane) {
+        renderPane(pane, m_d_compositeOutput);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        panelTexture(pane).updateFromDevice(m_d_compositeOutput,
+                                            panelRenderWidth(pane), panelRenderHeight(pane));
+    }
+
+    // Cross-section: render to separate texture for floating panel
+    const int rw = renderWidth();
+    const int rh = renderHeight();
+    GpuViewport gpuVp;
+    gpuVp.center_lat = (float)m_viewport.center_lat;
+    gpuVp.center_lon = (float)m_viewport.center_lon;
+    gpuVp.deg_per_pixel_x =
+        (1.0f / (float)m_viewport.zoom) * ((float)radarPanelRect(0).width / (float)rw);
+    gpuVp.deg_per_pixel_y =
+        (1.0f / (float)m_viewport.zoom) * ((float)radarPanelRect(0).height / (float)rh);
+    gpuVp.width = rw;
+    gpuVp.height = rh;
+
+    int xsStationSlot = m_historicMode ? 0 : m_activeStationIdx;
+    const float activeThreshold = (m_activeProduct == PROD_VEL)
+        ? m_velocityMinThreshold
+        : m_dbzMinThreshold;
+    if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
+        xsStationSlot < (int)m_stations.size()) {
+        GpuStationInfo stInfo = {};
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            stInfo = m_stations[xsStationSlot].gpuInfo;
+        }
+        m_xsWidth = gpuVp.width;
+        m_xsHeight = gpuVp.height / 3;
+        if (m_xsHeight < 200) m_xsHeight = 200;
+
+        ensureCrossSectionBuffer(m_xsWidth, m_xsHeight);
+        m_xsTex.resize(m_xsWidth, m_xsHeight);
+
+        gpu::renderCrossSection(
+            m_activeStationIdx, m_activeProduct, activeThreshold,
+            m_xsStartLat, m_xsStartLon, m_xsEndLat, m_xsEndLon,
+            stInfo.lat, stInfo.lon,
+            m_xsWidth, m_xsHeight, m_d_xsOutput);
+
+        m_xsTex.updateFromDevice(m_d_xsOutput, m_xsWidth, m_xsHeight);
+    }
+
+    updateMemoryTelemetry();
 }
 
 void App::onScroll(double xoff, double yoff) {
@@ -3903,9 +4268,28 @@ void App::onMouseDrag(double dx, double dy) {
 }
 
 void App::onMouseMove(double mx, double my) {
+    const int panelCount = panelRenderCount();
+    int panelIdx = 0;
+    bool insidePanel = false;
+    for (int i = 0; i < panelCount; ++i) {
+        const RadarPanelRect rect = radarPanelRect(i);
+        if (mx >= rect.x && mx <= rect.x + rect.width &&
+            my >= rect.y && my <= rect.y + rect.height) {
+            panelIdx = i;
+            insidePanel = true;
+            break;
+        }
+    }
+    if (!insidePanel && panelCount > 1)
+        return;
+
+    const RadarPanelRect rect = radarPanelRect(panelIdx);
+    const double localMx = mx - rect.x;
+    const double localMy = my - rect.y;
+
     // Convert mouse pixel to lat/lon
-    m_mouseLon = (float)(m_viewport.center_lon + (mx - m_viewport.width * 0.5) / m_viewport.zoom);
-    m_mouseLat = (float)(m_viewport.center_lat - (my - m_viewport.height * 0.5) / m_viewport.zoom);
+    m_mouseLon = (float)(m_viewport.center_lon + (localMx - rect.width * 0.5) / m_viewport.zoom);
+    m_mouseLat = (float)(m_viewport.center_lat - (localMy - rect.height * 0.5) / m_viewport.zoom);
 
     if (!m_autoTrackStation)
         return;
@@ -3941,20 +4325,40 @@ std::string App::activeStationName() const {
 }
 
 int App::stationAtScreen(double mx, double my, float radiusPx) const {
+    const int panelCount = panelRenderCount();
+    int panelIdx = 0;
+    bool insidePanel = false;
+    for (int i = 0; i < panelCount; ++i) {
+        const RadarPanelRect rect = radarPanelRect(i);
+        if (mx >= rect.x && mx <= rect.x + rect.width &&
+            my >= rect.y && my <= rect.y + rect.height) {
+            panelIdx = i;
+            insidePanel = true;
+            break;
+        }
+    }
+    if (!insidePanel && panelCount > 1)
+        return -1;
+
+    const RadarPanelRect rect = radarPanelRect(panelIdx);
+    const double localMx = mx - rect.x;
+    const double localMy = my - rect.y;
     float bestDist = radiusPx * radiusPx;
     int bestIdx = -1;
 
     std::lock_guard<std::mutex> lock(m_stationMutex);
     for (int i = 0; i < (int)m_stations.size(); i++) {
+        if (!m_showExperimentalSites && NEXRAD_STATIONS[i].experimental)
+            continue;
         const float slat = m_stations[i].gpuInfo.lat != 0.0f ? m_stations[i].gpuInfo.lat : m_stations[i].lat;
         const float slon = m_stations[i].gpuInfo.lon != 0.0f ? m_stations[i].gpuInfo.lon : m_stations[i].lon;
         const auto markerOffset = stationMarkerPixelOffset(i);
-        const float sx = (float)((slon - m_viewport.center_lon) * m_viewport.zoom + m_viewport.width * 0.5) +
+        const float sx = (float)((slon - m_viewport.center_lon) * m_viewport.zoom + rect.width * 0.5) +
                          markerOffset.first;
-        const float sy = (float)((m_viewport.center_lat - slat) * m_viewport.zoom + m_viewport.height * 0.5) +
+        const float sy = (float)((m_viewport.center_lat - slat) * m_viewport.zoom + rect.height * 0.5) +
                          markerOffset.second;
-        const float dx = (float)mx - sx;
-        const float dy = (float)my - sy;
+        const float dx = (float)localMx - sx;
+        const float dy = (float)localMy - sy;
         const float dist = dx * dx + dy * dy;
         if (dist <= bestDist) {
             bestDist = dist;
@@ -3968,6 +4372,7 @@ int App::stationAtScreen(double mx, double my, float radiusPx) const {
 void App::toggleShowAll() {
     m_showAll = !m_showAll;
     m_mode3D = false;
+    invalidatePanelCaches();
     invalidateFrameCache(true);
     m_volumeBuilt = false;
     m_volumeStation = -1;
@@ -3996,8 +4401,10 @@ void App::selectStation(int idx, bool centerView, double zoom) {
     const bool stationChanged = (idx != m_activeStationIdx);
     m_activeStationIdx = idx;
     m_autoTrackStation = false;
-    if (stationChanged)
+    if (stationChanged) {
+        invalidatePanelCaches();
         invalidateLiveLoop(false);
+    }
 
     if (centerView) {
         std::lock_guard<std::mutex> lock(m_stationMutex);
@@ -4034,6 +4441,10 @@ void App::onResize(int w, int h) {
     if (w <= 0 || h <= 0) return;
     m_viewport.width = w;
     m_viewport.height = h;
+    if (m_radarCanvasWidth <= 0 || m_radarCanvasHeight <= 0) {
+        m_radarCanvasWidth = w;
+        m_radarCanvasHeight = h;
+    }
     m_needsComposite = true;
     m_needsRerender = true;
     invalidateFrameCache(true);
@@ -4057,11 +4468,13 @@ void App::setProduct(int p) {
     if (p < 0 || p >= (int)Product::COUNT) return;
     if (p == m_activeProduct) return;
     m_activeProduct = p;
+    m_radarPanels[0].product = p;
     m_activeTilt = 0; // reset tilt - different products have different valid tilts
     m_lastHistoricFrame = -1; // force re-upload in historic mode
     m_maxTilts = 1;
     m_volumeBuilt = false;
     m_volumeStation = -1;
+    invalidatePanelCaches();
     invalidateFrameCache(true);
     m_needsRerender = true;
 
@@ -4100,6 +4513,7 @@ void App::setTilt(int t) {
     m_activeTilt = t;
     m_volumeBuilt = false;
     m_volumeStation = -1;
+    invalidatePanelCaches();
     invalidateFrameCache(true);
 
     if (m_historicMode) {
@@ -4169,6 +4583,7 @@ void App::onMiddleDrag(double mx, double my) {
 
 void App::toggleCrossSection() {
     m_crossSection = !m_crossSection;
+    invalidatePanelCaches();
     if (m_crossSection) {
         m_mode3D = false;
 
@@ -4204,6 +4619,7 @@ void App::toggleCrossSection() {
 void App::toggle3D() {
     m_mode3D = !m_mode3D;
     m_showAll = false;
+    invalidatePanelCaches();
     if (m_mode3D) {
         m_camera = {32.0f, 24.0f, 440.0f, 54.0f};
         rebuildVolumeForCurrentSelection();
@@ -4242,6 +4658,7 @@ void App::loadHistoricEvent(int idx) {
     m_lastHistoricFrame = -1;
     m_volumeBuilt = false;
     m_volumeStation = -1;
+    invalidatePanelCaches();
     invalidateFrameCache(true);
     m_warnings.clearHistoric();
     m_historic.loadEvent(idx);
@@ -4365,6 +4782,7 @@ void App::uploadHistoricFrame(int frameIdx) {
 void App::refreshData() {
     printf("Refreshing data from AWS...\n");
     const bool clearExistingScene = m_snapshotMode || m_historicMode;
+    invalidatePanelCaches();
     m_lastRefresh = std::chrono::steady_clock::now();
     m_autoTrackStation = true;
     m_historic.cancel();
@@ -4411,6 +4829,7 @@ void App::refreshData() {
 void App::loadMarch302025Snapshot(bool lowestSweepOnly) {
     printf("Loading all-site archive snapshot for 2025-03-30 21:00 UTC%s...\n",
            lowestSweepOnly ? " (lowest sweep only)" : "");
+    invalidatePanelCaches();
     m_lastRefresh = std::chrono::steady_clock::now();
     m_historic.cancel();
     m_historicMode = false;

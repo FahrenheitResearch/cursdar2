@@ -626,27 +626,27 @@ bool WarningRenderOptions::allows(const WarningPolygon& warning) const {
     if (!enabled) return false;
 
     if (isWatchEvent(warning.event)) {
-        if (!showWatches) return false;
+        return showWatches;
     } else if (containsInsensitive(warning.event, "special weather statement")) {
-        if (!showSpecialWeatherStatements || !showStatements) return false;
+        return showSpecialWeatherStatements && showStatements;
     } else if (isStatementEvent(warning.event)) {
-        if (!showStatements) return false;
+        return showStatements;
     } else if (isAdvisoryEvent(warning.event)) {
-        if (!showAdvisories) return false;
+        return showAdvisories;
     } else if (isWarningEvent(warning.event)) {
         if (!showWarnings) return false;
+        switch (warning.group) {
+            case WarningGroup::Tornado: return showTornado;
+            case WarningGroup::Severe:  return showSevere;
+            case WarningGroup::Fire:    return showFire;
+            case WarningGroup::Flood:   return showFlood;
+            case WarningGroup::Marine:  return showMarine;
+            default:                    return showOther;
+        }
     } else if (!showOther) {
         return false;
     }
-
-    switch (warning.group) {
-        case WarningGroup::Tornado: return showTornado;
-        case WarningGroup::Severe:  return showSevere;
-        case WarningGroup::Fire:    return showFire;
-        case WarningGroup::Flood:   return showFlood;
-        case WarningGroup::Marine:  return showMarine;
-        default:                    return showOther;
-    }
+    return showOther;
 }
 
 uint32_t WarningRenderOptions::resolvedColor(const WarningPolygon& warning) const {

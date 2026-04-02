@@ -215,10 +215,10 @@ void ensureDockLayout() {
     ImGuiID dockRightTop = 0;
     ImGuiID dockRightBottom = 0;
 
-    ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.23f, &dockLeft, &dockCenter);
-    ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Right, 0.27f, &dockRight, &dockCenter);
-    ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Down, 0.28f, &dockBottom, &dockCenter);
-    ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Down, 0.52f, &dockRightBottom, &dockRightTop);
+    ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.18f, &dockLeft, &dockCenter);
+    ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Right, 0.20f, &dockRight, &dockCenter);
+    ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Down, 0.22f, &dockBottom, &dockCenter);
+    ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Down, 0.48f, &dockRightBottom, &dockRightTop);
 
     ImGui::DockBuilderDockWindow("Operator Console", dockLeft);
     ImGui::DockBuilderDockWindow("Inspector", dockRightTop);
@@ -227,6 +227,232 @@ void ensureDockLayout() {
     ImGui::DockBuilderDockWindow("Cross-Section Console", dockBottom);
     ImGui::DockBuilderDockWindow("Historic Timeline", dockBottom);
     ImGui::DockBuilderFinish(dockspaceId);
+}
+
+Viewport paneViewport(const Viewport& root, const RadarPanelRect& rect) {
+    Viewport pane = root;
+    pane.width = rect.width;
+    pane.height = rect.height;
+    return pane;
+}
+
+ImVec2 paneOrigin(const ImGuiViewport* mainViewport, const RadarPanelRect& rect) {
+    return ImVec2(mainViewport->Pos.x + (float)rect.x,
+                  mainViewport->Pos.y + (float)rect.y);
+}
+
+void drawRadarPane(App& app, const Viewport& rootVp, const ImGuiViewport* mainViewport,
+                   const std::vector<StationUiState>& stations,
+                   const std::vector<WarningPolygon>& warnings,
+                   int paneIndex) {
+    const RadarPanelRect rect = app.radarPanelRect(paneIndex);
+    const Viewport paneVp = paneViewport(rootVp, rect);
+    const ImVec2 origin = paneOrigin(mainViewport, rect);
+    auto* drawList = ImGui::GetBackgroundDrawList();
+    drawList->PushClipRect(origin,
+                           ImVec2(origin.x + rect.width, origin.y + rect.height),
+                           true);
+
+    app.basemap().drawBase(drawList, paneVp, origin);
+    drawList->AddImage(
+        (ImTextureID)(uintptr_t)app.panelTexture(paneIndex).textureId(),
+        origin,
+        ImVec2(origin.x + rect.width, origin.y + rect.height));
+    app.basemap().drawOverlay(drawList, paneVp, origin);
+
+    const int activeIdx = app.activeStation();
+    float slat = 0.0f, slon = 0.0f;
+    if (app.m_historicMode) {
+        auto* ev = app.m_historic.currentEvent();
+        if (ev) {
+            for (int i = 0; i < NUM_NEXRAD_STATIONS; i++) {
+                if (strcmp(NEXRAD_STATIONS[i].icao, ev->station) == 0) {
+                    slat = NEXRAD_STATIONS[i].lat;
+                    slon = NEXRAD_STATIONS[i].lon;
+                    break;
+                }
+            }
+        }
+        if (slat == 0.0f && slon == 0.0f) {
+            const std::string histStation = app.m_historic.currentStation();
+            for (int i = 0; i < NUM_NEXRAD_STATIONS; i++) {
+                if (histStation == NEXRAD_STATIONS[i].icao) {
+                    slat = NEXRAD_STATIONS[i].lat;
+                    slon = NEXRAD_STATIONS[i].lon;
+                    break;
+                }
+            }
+        }
+    } else if (activeIdx >= 0 && activeIdx < (int)stations.size()) {
+        slat = stations[activeIdx].display_lat;
+        slon = stations[activeIdx].display_lon;
+    }
+
+    if (slat != 0.0f && slon != 0.0f && !app.showAll() && !app.mode3D()) {
+        float scx = origin.x + (float)((slon - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+        float scy = origin.y + (float)((paneVp.center_lat - slat) * paneVp.zoom + paneVp.height * 0.5);
+        constexpr float kmPerDeg = 111.0f;
+        ImU32 ringCol = IM_COL32(60, 60, 80, 100);
+        for (int r = 50; r <= 450; r += 50) {
+            float deg = (float)r / kmPerDeg;
+            float pxRadius = (float)(deg * paneVp.zoom);
+            if (pxRadius < 10 || pxRadius > paneVp.width * 3) continue;
+            drawList->AddCircle(ImVec2(scx, scy), pxRadius, ringCol, 72);
+            if (pxRadius > 30) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%d", r);
+                drawList->AddText(ImVec2(scx + pxRadius + 2, scy - 7),
+                                  IM_COL32(80, 80, 110, 140), buf);
+            }
+        }
+
+        ImU32 azCol = IM_COL32(50, 50, 70, 70);
+        float maxR = 460.0f / kmPerDeg * (float)paneVp.zoom;
+        const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+        for (int d = 0; d < 8; d++) {
+            float angle = d * 45.0f * 3.14159265f / 180.0f;
+            float ex = scx + sinf(angle) * maxR;
+            float ey = scy - cosf(angle) * maxR;
+            float lw = (d % 2 == 0) ? 1.0f : 0.5f;
+            drawList->AddLine(ImVec2(scx, scy), ImVec2(ex, ey), azCol, lw);
+            float lx = scx + sinf(angle) * fminf(maxR, 60.0f);
+            float ly = scy - cosf(angle) * fminf(maxR, 60.0f);
+            if (d % 2 == 0)
+                drawList->AddText(ImVec2(lx - 4, ly - 7),
+                                  IM_COL32(100, 100, 140, 180), dirs[d]);
+        }
+    }
+
+    if (!app.m_historicMode) {
+        for (int i = 0; i < (int)stations.size(); i++) {
+            const auto& st = stations[i];
+            if (!app.showExperimentalSites() && NEXRAD_STATIONS[i].experimental) continue;
+
+            float px = origin.x + (float)((st.display_lon - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+            float py = origin.y + (float)((paneVp.center_lat - st.display_lat) * paneVp.zoom + paneVp.height * 0.5);
+            if (px < origin.x - 50 || px > origin.x + paneVp.width + 50 ||
+                py < origin.y - 50 || py > origin.y + paneVp.height + 50)
+                continue;
+
+            const bool isActive = (i == activeIdx);
+            const float boxW = 36.0f;
+            const float boxH = 14.0f;
+
+            ImU32 bgCol;
+            ImU32 borderCol;
+            ImU32 textCol;
+            if (!st.enabled) {
+                bgCol = isActive ? IM_COL32(95, 95, 105, 220) : IM_COL32(52, 52, 58, 170);
+                borderCol = isActive ? IM_COL32(185, 185, 195, 255) : IM_COL32(96, 96, 104, 190);
+                textCol = IM_COL32(185, 185, 195, 230);
+            } else {
+                bgCol = isActive ? IM_COL32(0, 180, 80, 220) : IM_COL32(40, 40, 50, 180);
+                borderCol = isActive ? IM_COL32(100, 255, 150, 255) : IM_COL32(80, 80, 100, 200);
+                textCol = isActive ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 180, 200, 220);
+            }
+
+            ImVec2 tl(px - boxW * 0.5f, py - boxH * 0.5f);
+            ImVec2 br(px + boxW * 0.5f, py + boxH * 0.5f);
+            drawList->AddRectFilled(tl, br, bgCol, 3.0f);
+            drawList->AddRect(tl, br, borderCol, 3.0f);
+
+            const char* label = st.icao.c_str();
+            ImVec2 textSize = ImGui::CalcTextSize(label);
+            drawList->AddText(ImVec2(px - textSize.x * 0.5f, py - textSize.y * 0.5f), textCol, label);
+        }
+    }
+
+    if (!warnings.empty() && app.m_warningOptions.enabled) {
+        for (const auto& w : warnings) {
+            if (w.lats.size() < 3) continue;
+            std::vector<ImVec2> pts;
+            pts.reserve(w.lats.size());
+            bool anyOnScreen = false;
+            for (int i = 0; i < (int)w.lats.size(); i++) {
+                float sx = origin.x + (float)((w.lons[i] - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+                float sy = origin.y + (float)((paneVp.center_lat - w.lats[i]) * paneVp.zoom + paneVp.height * 0.5);
+                pts.push_back(ImVec2(sx, sy));
+                if (sx > origin.x - 100 && sx < origin.x + paneVp.width + 100 &&
+                    sy > origin.y - 100 && sy < origin.y + paneVp.height + 100)
+                    anyOnScreen = true;
+            }
+            if (!anyOnScreen) continue;
+
+            if (app.m_warningOptions.fillPolygons && pts.size() >= 3)
+                drawList->AddConcavePolyFilled(pts.data(), (int)pts.size(),
+                                               app.m_warningOptions.resolvedFillColor(w));
+            if (app.m_warningOptions.outlinePolygons) {
+                uint32_t outlineCol = (w.color & 0x00FFFFFFu) | 0xFF000000u;
+                for (int i = 0; i < (int)pts.size(); i++) {
+                    int j = (i + 1) % (int)pts.size();
+                    drawList->AddLine(pts[i], pts[j], outlineCol, w.line_width);
+                }
+            }
+        }
+    }
+
+    if (activeIdx >= 0 && activeIdx < (int)stations.size()) {
+        const auto& det = stations[activeIdx].detection;
+        if (app.m_showTDS) {
+            for (const auto& t : det.tds) {
+                float sx = origin.x + (float)((t.lon - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+                float sy = origin.y + (float)((paneVp.center_lat - t.lat) * paneVp.zoom + paneVp.height * 0.5);
+                if (sx < origin.x - 20 || sx > origin.x + paneVp.width + 20 ||
+                    sy < origin.y - 20 || sy > origin.y + paneVp.height + 20) continue;
+                float sz = 6.0f;
+                drawList->AddTriangleFilled(
+                    ImVec2(sx, sy + sz), ImVec2(sx - sz, sy - sz), ImVec2(sx + sz, sy - sz),
+                    IM_COL32(255, 255, 255, 200));
+                drawList->AddTriangle(
+                    ImVec2(sx, sy + sz), ImVec2(sx - sz, sy - sz), ImVec2(sx + sz, sy - sz),
+                    IM_COL32(255, 0, 0, 255), 2.0f);
+            }
+        }
+        if (app.m_showHail) {
+            for (const auto& h : det.hail) {
+                float sx = origin.x + (float)((h.lon - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+                float sy = origin.y + (float)((paneVp.center_lat - h.lat) * paneVp.zoom + paneVp.height * 0.5);
+                if (sx < origin.x - 20 || sx > origin.x + paneVp.width + 20 ||
+                    sy < origin.y - 20 || sy > origin.y + paneVp.height + 20) continue;
+                float r = 5.0f;
+                ImU32 col = h.value > 10.0f ? IM_COL32(255, 50, 255, 220) : IM_COL32(0, 255, 100, 200);
+                drawList->AddCircleFilled(ImVec2(sx, sy), r, col);
+                drawList->AddText(ImVec2(sx - 3, sy - 6), IM_COL32(0, 0, 0, 255), "H");
+            }
+        }
+        if (app.m_showMeso) {
+            for (const auto& m : det.meso) {
+                float sx = origin.x + (float)((m.lon - paneVp.center_lon) * paneVp.zoom + paneVp.width * 0.5);
+                float sy = origin.y + (float)((paneVp.center_lat - m.lat) * paneVp.zoom + paneVp.height * 0.5);
+                if (sx < origin.x - 20 || sx > origin.x + paneVp.width + 20 ||
+                    sy < origin.y - 20 || sy > origin.y + paneVp.height + 20) continue;
+                float r = m.shear > 30.0f ? 10.0f : 7.0f;
+                ImU32 col = m.shear > 30.0f ? IM_COL32(255, 0, 0, 255) : IM_COL32(255, 255, 0, 255);
+                drawList->AddCircle(ImVec2(sx, sy), r, col, 12, 2.5f);
+                drawList->AddLine(ImVec2(sx + r, sy), ImVec2(sx + r - 3, sy - 3), col, 2.0f);
+                drawList->AddLine(ImVec2(sx + r, sy), ImVec2(sx + r + 1, sy - 4), col, 2.0f);
+            }
+        }
+    }
+
+    char paneLabel[96];
+    std::snprintf(paneLabel, sizeof(paneLabel), "%s  |  T%d",
+                  PRODUCT_INFO[app.radarPanelProduct(paneIndex)].name,
+                  app.activeTilt() + 1);
+    ImVec2 textSize = ImGui::CalcTextSize(paneLabel);
+    ImVec2 badgeTl(origin.x + 10.0f, origin.y + 48.0f);
+    ImVec2 badgeBr(badgeTl.x + textSize.x + 16.0f, badgeTl.y + textSize.y + 8.0f);
+    drawList->AddRectFilled(badgeTl, badgeBr, IM_COL32(8, 12, 18, 190), 4.0f);
+    drawList->AddRect(badgeTl, badgeBr,
+                      paneIndex == 0 ? IM_COL32(100, 210, 255, 200) : IM_COL32(90, 90, 110, 180),
+                      4.0f);
+    drawList->AddText(ImVec2(badgeTl.x + 8.0f, badgeTl.y + 4.0f),
+                      IM_COL32(230, 236, 244, 240), paneLabel);
+
+    drawList->AddRect(origin,
+                      ImVec2(origin.x + rect.width, origin.y + rect.height),
+                      IM_COL32(35, 42, 56, 180), 0.0f, 0, 1.0f);
+    drawList->PopClipRect();
 }
 
 } // namespace
@@ -268,6 +494,7 @@ void render(App& app) {
     static char archiveStart[8] = "";
     static char archiveEnd[8] = "";
     static std::string archiveStatus;
+    static bool collapseAuxPanelsThisLaunch = true;
 
     seedArchiveInputs(archiveDate, sizeof(archiveDate),
                       archiveStart, sizeof(archiveStart),
@@ -283,8 +510,23 @@ void render(App& app) {
     ImGui::DockSpaceOverViewport(dockspaceId, ImGui::GetMainViewport(),
                                  ImGuiDockNodeFlags_PassthruCentralNode);
     ensureDockLayout();
+    if (ImGuiDockNode* centralNode = ImGui::DockBuilderGetCentralNode(dockspaceId)) {
+        app.setRadarCanvasRect((int)(centralNode->Pos.x - mainViewport->Pos.x),
+                               (int)(centralNode->Pos.y - mainViewport->Pos.y),
+                               (int)centralNode->Size.x, (int)centralNode->Size.y);
+    } else {
+        app.setRadarCanvasRect(0, 0,
+                               (int)mainViewport->Size.x, (int)mainViewport->Size.y);
+    }
+    const bool multiPanel = app.radarPanelCount() > 1;
+
+    if (multiPanel) {
+        for (int pane = 0; pane < app.radarPanelCount(); ++pane)
+            drawRadarPane(app, vp, mainViewport, stations, warnings, pane);
+    }
 
     // Background radar image
+    if (!multiPanel) {
     auto* drawList = ImGui::GetBackgroundDrawList();
     app.basemap().drawBase(drawList, vp, mainViewport->Pos);
     drawList->AddImage(
@@ -371,6 +613,7 @@ void render(App& app) {
     }
 
     // ── Status bar (top) ────────────────────────────────────
+    }
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2((float)vp.width, 38));
     ImGui::Begin("##statusbar", nullptr,
@@ -436,7 +679,7 @@ void render(App& app) {
     ImGui::End();
 
     // ── Controls panel (left) ───────────────────────────────
-    ImGui::SetNextWindowSize(ImVec2(320, 760), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(290, 740), ImGuiCond_FirstUseEver);
     ImGui::Begin("Operator Console");
 
     // Product buttons
@@ -490,6 +733,9 @@ void render(App& app) {
     if (ImGui::CollapsingHeader("Radar Activation", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Text("Enabled Sites: %d / %d", app.enabledStationCount(), app.stationsTotal());
         ImGui::TextWrapped("Gray map sites are idle. Click a site in the browser or on the map to enable it.");
+        bool showExperimental = app.showExperimentalSites();
+        if (ImGui::Checkbox("Show Experimental/Testbed Sites", &showExperimental))
+            app.setShowExperimentalSites(showExperimental);
         const int activeIdx = app.activeStation();
         if (activeIdx >= 0 && activeIdx < NUM_NEXRAD_STATIONS) {
             const bool enabled = app.stationEnabled(activeIdx);
@@ -516,6 +762,47 @@ void render(App& app) {
     bool showAll = app.showAll();
     if (ImGui::Button(showAll ? "Single Station" : "Show All (A)", ImVec2(210, 24)))
         app.toggleShowAll();
+
+    if (ImGui::CollapsingHeader("Panel Layout", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kPanelLayouts[] = {"Single", "Dual", "Quad"};
+        int layoutIdx = 0;
+        switch (app.radarPanelLayout()) {
+            case RadarPanelLayout::Dual: layoutIdx = 1; break;
+            case RadarPanelLayout::Quad: layoutIdx = 2; break;
+            case RadarPanelLayout::Single:
+            default: layoutIdx = 0; break;
+        }
+        ImGui::SetNextItemWidth(210);
+        if (ImGui::Combo("Layout", &layoutIdx, kPanelLayouts, IM_ARRAYSIZE(kPanelLayouts))) {
+            const RadarPanelLayout layouts[] = {
+                RadarPanelLayout::Single,
+                RadarPanelLayout::Dual,
+                RadarPanelLayout::Quad
+            };
+            app.setRadarPanelLayout(layouts[layoutIdx]);
+        }
+
+        ImGui::TextDisabled("Pane 1 follows the main product and tilt controls.");
+        for (int pane = 1; pane < (int)app.radarPanelLayout(); ++pane) {
+            int product = app.radarPanelProduct(pane);
+            char comboLabel[32];
+            std::snprintf(comboLabel, sizeof(comboLabel), "Pane %d", pane + 1);
+            ImGui::SetNextItemWidth(210);
+            if (ImGui::BeginCombo(comboLabel, PRODUCT_INFO[product].name)) {
+                for (int p = 0; p < (int)Product::COUNT; ++p) {
+                    const bool selected = (product == p);
+                    if (ImGui::Selectable(PRODUCT_INFO[p].name, selected))
+                        app.setRadarPanelProduct(pane, p);
+                    if (selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
+
+        if (app.mode3D() || app.crossSection())
+            ImGui::TextDisabled("3D and cross-section force a single radar pane.");
+    }
 
     ImGui::Separator();
     if (ImGui::Button("Refresh Data", ImVec2(210, 24)))
@@ -812,7 +1099,8 @@ void render(App& app) {
     // ── Single-station timeline (historic mode) ─────────────
     if (app.m_historicMode) {
         auto& hist = app.m_historic;
-        ImGui::SetNextWindowSize(ImVec2(640, 180), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(560, 170), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
         ImGui::Begin("Historic Timeline");
 
         if (hist.loading()) {
@@ -862,7 +1150,8 @@ void render(App& app) {
     }
 
     if (!app.m_historicMode && !app.snapshotMode() && app.liveLoopEnabled()) {
-        ImGui::SetNextWindowSize(ImVec2(640, 160), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(560, 150), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
         ImGui::Begin("Realtime Loop");
 
         if (app.liveLoopAvailableFrames() <= 0) {
@@ -897,7 +1186,8 @@ void render(App& app) {
     static char stationFilter[64] = "";
     static bool onlyReady = false;
 
-    ImGui::SetNextWindowSize(ImVec2(420, 620), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::Begin("Station Browser");
 
     ImGui::InputTextWithHint("##station_filter", "Filter ICAO, city, state", stationFilter, sizeof(stationFilter));
@@ -907,6 +1197,7 @@ void render(App& app) {
 
     for (int i = 0; i < (int)stations.size(); i++) {
         const auto& st = stations[i];
+        if (!app.showExperimentalSites() && NEXRAD_STATIONS[i].experimental) continue;
         if (onlyReady && !st.uploaded && !st.parsed) continue;
 
         std::string searchBlob = st.icao + " " + NEXRAD_STATIONS[i].name + " " + NEXRAD_STATIONS[i].state;
@@ -969,7 +1260,8 @@ void render(App& app) {
     ImGui::End();
     skip_station_list:
 
-    ImGui::SetNextWindowSize(ImVec2(360, 360), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320, 320), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::Begin("Inspector");
     ImGui::Text("Cursor");
     ImGui::Separator();
@@ -1054,7 +1346,8 @@ void render(App& app) {
     }
     ImGui::End();
 
-    ImGui::SetNextWindowSize(ImVec2(520, 220), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(420, 220), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::Begin("Warnings");
     if (ImGui::CollapsingHeader("Display Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Enable Alert Overlays", &app.m_warningOptions.enabled);
@@ -1116,6 +1409,7 @@ void render(App& app) {
     }
     ImGui::End();
 
+    if (!multiPanel) {
     // ── Station markers on map (hide in historic mode) ──────
     if (app.m_historicMode) goto skip_station_markers;
     {
@@ -1124,6 +1418,7 @@ void render(App& app) {
 
         for (int i = 0; i < (int)stations.size(); i++) {
             const auto& st = stations[i];
+            if (!app.showExperimentalSites() && NEXRAD_STATIONS[i].experimental) continue;
 
             // Convert lat/lon to screen pixel
             float px = (float)((st.display_lon - vp.center_lon) * vp.zoom + vp.width * 0.5);
@@ -1251,6 +1546,8 @@ void render(App& app) {
     }
 
     // ── Cross-section line overlay ────────────────────���───────
+    }
+
     if (app.crossSection()) {
         auto* dl2 = ImGui::GetBackgroundDrawList();
         // Draw the cross-section line on the radar view
@@ -1272,6 +1569,7 @@ void render(App& app) {
             ImGui::SetNextWindowPos(ImVec2((float)vp.width * 0.1f,
                                            (float)vp.height - panelH - 10), ImGuiCond_Once);
             ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Once);
+            ImGui::SetNextWindowCollapsed(true, collapseAuxPanelsThisLaunch ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
             ImGui::Begin("Cross-Section Console", nullptr,
                          ImGuiWindowFlags_NoCollapse);
 
@@ -1341,6 +1639,8 @@ void render(App& app) {
         else if (!app.m_historicMode && app.liveLoopEnabled() && ImGui::IsKeyPressed(ImGuiKey_Space))
             app.toggleLiveLoopPlayback();
     }
+
+    collapseAuxPanelsThisLaunch = false;
 }
 
 void shutdown() {

@@ -13,6 +13,7 @@
 #include "historic.h"
 #include <vector>
 #include <deque>
+#include <array>
 #include <string>
 #include <mutex>
 #include <atomic>
@@ -152,6 +153,33 @@ struct ProbSevereObject {
     float avg_beam_height_km = 0.0f;
 };
 
+enum class RadarPanelLayout {
+    Single = 1,
+    Dual = 2,
+    Quad = 4
+};
+
+struct RadarPanelRect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+struct RadarPanelConfig {
+    int product = PROD_REF;
+};
+
+struct RadarPanelCacheState {
+    bool valid = false;
+    bool historic = false;
+    int station_idx = -1;
+    int frame_idx = -1;
+    int product = -1;
+    int tilt = -1;
+    std::string volume_key;
+};
+
 class App {
 public:
     App();
@@ -213,6 +241,8 @@ public:
     int             stationsTotal() const { return m_stationsTotal; }
     int             stationsDownloading() const { return m_stationsDownloading.load(); }
     GlCudaTexture&  outputTexture() { return m_outputTex; }
+    GlCudaTexture&  panelTexture(int index);
+    const GlCudaTexture& panelTexture(int index) const;
     int             framebufferWidth() const { return m_windowWidth; }
     int             framebufferHeight() const { return m_windowHeight; }
     bool            autoTrackStation() const { return m_autoTrackStation; }
@@ -227,6 +257,13 @@ public:
     const std::string& gpuName() const { return m_gpuName; }
     BasemapRenderer& basemap() { return m_basemap; }
     const BasemapRenderer& basemap() const { return m_basemap; }
+    RadarPanelLayout radarPanelLayout() const { return m_radarPanelLayout; }
+    void            setRadarPanelLayout(RadarPanelLayout layout);
+    int             radarPanelCount() const;
+    RadarPanelRect  radarPanelRect(int index) const;
+    int             radarPanelProduct(int index) const;
+    void            setRadarPanelProduct(int index, int product);
+    void            setRadarCanvasRect(int x, int y, int width, int height);
     std::vector<WarningPolygon> currentWarnings() const;
     bool            loadColorTableFromFile(const std::string& path);
     void            resetColorTable(int product = -1);
@@ -251,6 +288,8 @@ public:
     void            setStationEnabled(int idx, bool enabled);
     int             enabledStationCount() const;
     void            disableAllStations();
+    bool            showExperimentalSites() const { return m_showExperimentalSites; }
+    void            setShowExperimentalSites(bool show);
     bool            stationPinned(int idx) const;
     void            setStationPinned(int idx, bool pinned);
     bool            stationPriorityHot(int idx) const;
@@ -323,6 +362,9 @@ private:
     PerformanceProfile recommendedPerformanceProfile() const;
     int renderWidth() const;
     int renderHeight() const;
+    int panelRenderWidth(int index) const;
+    int panelRenderHeight(int index) const;
+    int panelRenderCount() const;
     int historicFrameCacheLimit() const;
     bool historicFrameCachingEnabled() const;
     void invalidateLiveLoop(bool freeMemory = false);
@@ -347,6 +389,15 @@ private:
                                                   const std::vector<int>& seed) const;
     float priorityScoreForStation(int stationIdx,
                                   const std::vector<ProbSevereObject>& objects) const;
+    void renderPane(int paneIndex, uint32_t* d_output);
+    bool uploadSweepSetToSlot(int slot,
+                              const std::vector<PrecomputedSweep>& sweeps,
+                              float stationLat, float stationLon,
+                              int product, int tilt,
+                              float* outElevationAngle = nullptr) const;
+    bool ensurePanelCacheUpload(int paneIndex, int product, int tilt,
+                                float* outElevationAngle = nullptr);
+    void invalidatePanelCaches();
 
     Viewport         m_viewport;
     int              m_activeProduct = 0;
@@ -373,6 +424,7 @@ private:
     // GPU compositor output
     uint32_t*       m_d_compositeOutput = nullptr;
     GlCudaTexture   m_outputTex;
+    GlCudaTexture   m_panelTextures[3];
     BasemapRenderer m_basemap;
 
     // Spatial grid for fast station lookup in compositor
@@ -395,6 +447,19 @@ private:
     float m_mouseLat = 39.0f, m_mouseLon = -98.0f;
     bool  m_autoTrackStation = true;
     bool  m_showAll = false;
+    bool  m_showExperimentalSites = false;
+    RadarPanelLayout m_radarPanelLayout = RadarPanelLayout::Single;
+    int   m_radarCanvasX = 0;
+    int   m_radarCanvasY = 0;
+    int   m_radarCanvasWidth = 0;
+    int   m_radarCanvasHeight = 0;
+    std::array<RadarPanelConfig, 4> m_radarPanels = {{
+        {PROD_REF},
+        {PROD_VEL},
+        {PROD_CC},
+        {PROD_ZDR},
+    }};
+    std::array<RadarPanelCacheState, 4> m_panelCacheStates = {};
     bool  m_mode3D = false;
     Camera3D m_camera = {32.0f, 24.0f, 440.0f, 54.0f};
     bool  m_volumeBuilt = false;
